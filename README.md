@@ -25,6 +25,17 @@ Applied image-analysis tooling for a narrow, explicit target:
 
 The detector localizes the sparkle cluster first. The remover then applies template-guided subtraction and residual cleanup in the matched region.
 
+## Evaluation snapshot
+
+Current numbers are from the private local fixture set used during development. Those fixtures are not bundled in the public repo, so the metrics below should be read as a transparent development snapshot rather than a public benchmark pack.
+
+- Detector localization: `9/9` images matched the expected watermark bounds on the private development set.
+- Detector showcase sample: `testimage.png` localized a `48px` sparkle cluster at `[1296, 687] -> [1343, 734]` with `0.999` confidence.
+- Weak-case remover match: a difficult `48px` default-placement image still locked at `67.2%` NCC after the fallback placement rule was added.
+- Large watermark case: the ShareFile-style sample locked a `96px` template at `x:3404, y:992` with `94.4%` NCC.
+- Post-clean verification: rerunning on the cleaned ShareFile sample produced no confident watermark rematch (`68.6%` max NCC, below threshold).
+- Browser workflow: the userscript path was validated live against the same private development set plus the ShareFile sample, replacing Gemini image fetch/download responses with cleaned local blobs.
+
 ## Why this repo exists
 
 This repository packages a practical watermark-analysis workflow into reproducible local tooling:
@@ -78,6 +89,25 @@ Remove the watermark:
 node remove-gemini-watermark.js .\input.png .\outputs\cleaned.png
 ```
 
+## Browser workflow
+
+The repository also includes a browser-side implementation: [`remove-gemini-watermark.userscript.js`](remove-gemini-watermark.userscript.js).
+
+It is designed for userscript managers such as [Tampermonkey](https://www.tampermonkey.net/) or compatible alternatives.
+
+Key behavior:
+
+- intercepts Gemini image fetch/download requests in-page
+- upgrades matching image URLs to full-resolution fetches where possible
+- runs the same local cleanup logic in-browser without uploading images elsewhere
+- swaps cleaned blob URLs into generated-image elements
+- exposes `window.geminiWatermarkRemover.rescan()` and `window.geminiWatermarkRemover.stats()` for manual inspection
+
+This makes the repo useful in two modes:
+
+- offline/local CLI experimentation on PNGs
+- live browser cleanup through a userscript workflow
+
 ## Detector showcase
 
 Example JSON output from the showcased detector run:
@@ -99,6 +129,23 @@ Example JSON output from the showcased detector run:
 }
 ```
 
+## Landscape and positioning
+
+Public Gemini watermark removers already exist across several formats:
+
+- GitHub projects such as [GargantuaX/gemini-watermark-remover](https://github.com/GargantuaX/gemini-watermark-remover), [allenk/GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool), [dearabhin/gemini-watermark-remover](https://github.com/dearabhin/gemini-watermark-remover), and [dinoBOLT/Gemini-Watermark-Remover](https://github.com/dinoBOLT/Gemini-Watermark-Remover)
+- browser extensions and web tools such as [SparkleErase AI](https://chromewebstore.google.com/detail/sparkleerase-ai-remove-ge/goinnhjbphpdckbaolkefcckoonamjjl), [Gemini Watermark Remover for Firefox](https://addons.mozilla.org/en-US/firefox/addon/gemini-watermark-remover-pro/), [Pilio](https://pilio.ai/gemini-watermark-remover), and [Gemini Watermark Cleaner](https://geminiwatermarkcleaner.com/)
+
+This repo is positioned differently:
+
+- it keeps the detector, remover, and userscript in one inspectable codebase
+- it documents the actual matching and cleanup methodology instead of only exposing a one-click UI
+- it ships debug-oriented artifacts such as detector overlays and confidence outputs
+- it is explicit about scope: visible Gemini sparkle removal, not a generalized claim about invisible provenance marks such as SynthID
+- it is structured as a research toolkit first, with reproducibility and failure-case notes alongside the code
+
+For a source-backed landscape snapshot, see [docs/landscape.md](docs/landscape.md).
+
 ## Repository contents
 
 - `detect-gemini-watermark.js`: CLI detector for bottom-right sparkle localization.
@@ -106,6 +153,7 @@ Example JSON output from the showcased detector run:
 - `remove-gemini-watermark.userscript.js`: in-browser Gemini userscript variant.
 - `scripts/create-github-comparison.ps1`: rebuilds the comparison sheet when local fixture images are available.
 - `docs/assets/detect-gemini-watermark-showcase.png`: example detector debug overlay.
+- `docs/landscape.md`: public-tool landscape snapshot and positioning notes.
 - `docs/methodology.md`: pipeline and heuristic notes.
 - `docs/research-direction.md`: current research direction and next-step questions.
 - `docs/assets/watermark-removal-results.png`: GitHub-friendly before/after comparison asset.
