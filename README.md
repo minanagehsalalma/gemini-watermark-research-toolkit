@@ -57,12 +57,38 @@ Remove the watermark:
 node remove-gemini-watermark.js .\input.png .\outputs\cleaned.png
 ```
 
+## Detector showcase
+
+Example detector overlay on a user-provided sample image:
+
+![Detector debug overlay example](docs/assets/detect-gemini-watermark-showcase.png)
+
+Example JSON output:
+
+```json
+{
+  "image": "testimage.png",
+  "answer": "The watermark is the white sparkle glyph in the bottom-right corner.",
+  "watermark": {
+    "kind": "sparkle-cluster",
+    "clusterBounds": {
+      "x0": 1296,
+      "y0": 687,
+      "x1": 1343,
+      "y1": 734
+    }
+  },
+  "confidence": 0.999
+}
+```
+
 ## Repository contents
 
 - `detect-gemini-watermark.js`: CLI detector for bottom-right sparkle localization.
 - `remove-gemini-watermark.js`: CLI remover with residual cleanup support.
 - `remove-gemini-watermark.userscript.js`: in-browser Gemini userscript variant.
 - `scripts/create-github-comparison.ps1`: rebuilds the comparison sheet when local fixture images are available.
+- `docs/assets/detect-gemini-watermark-showcase.png`: example detector debug overlay.
 - `docs/methodology.md`: pipeline and heuristic notes.
 - `docs/research-direction.md`: current research direction and next-step questions.
 - `docs/assets/watermark-removal-results.png`: GitHub-friendly before/after comparison asset.

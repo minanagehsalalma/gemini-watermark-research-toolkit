@@ -3,6 +3,7 @@ node_modules/
 outputs/
 TestSet/
 perplexity.log
+testimage.png
 
 *.log
 *.debug.png
