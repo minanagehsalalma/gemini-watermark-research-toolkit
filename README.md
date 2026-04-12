@@ -2,7 +2,28 @@
 
 Research-oriented Node.js tooling for detecting and removing Gemini's bottom-right sparkle watermark in PNG images.
 
-![Before and after watermark removal results](docs/assets/watermark-removal-results.png)
+Applied image-analysis tooling for a narrow, explicit target:
+
+- detect the visible Gemini sparkle watermark in PNG exports
+- inspect localization with a debug overlay
+- remove the visible mark with deterministic local cleanup
+
+## Visual proof
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <strong>Detector overlay</strong><br />
+      <img src="docs/assets/detect-gemini-watermark-showcase.png" alt="Detector debug overlay example" />
+    </td>
+    <td align="center" width="50%">
+      <strong>Removal results</strong><br />
+      <img src="docs/assets/watermark-removal-results.png" alt="Before and after watermark removal results" />
+    </td>
+  </tr>
+</table>
+
+The detector localizes the sparkle cluster first. The remover then applies template-guided subtraction and residual cleanup in the matched region.
 
 ## Why this repo exists
 
@@ -59,11 +80,7 @@ node remove-gemini-watermark.js .\input.png .\outputs\cleaned.png
 
 ## Detector showcase
 
-Example detector overlay on a user-provided sample image:
-
-![Detector debug overlay example](docs/assets/detect-gemini-watermark-showcase.png)
-
-Example JSON output:
+Example JSON output from the showcased detector run:
 
 ```json
 {
