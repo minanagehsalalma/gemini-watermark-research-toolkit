@@ -1,0 +1,11 @@
+node_modules/
+.playwright-mcp/
+outputs/
+TestSet/
+perplexity.log
+
+*.log
+*.debug.png
+*.zoom.png
+*.detail.png
+*sheet*.png
