@@ -6,7 +6,7 @@
 //
 //              (watermark still shows in the chat)
 // @namespace    mina-nageh
-// @version      2.2.0
+// @version      2.3.0
 // @author       mina nageh
 // @match        https://gemini.google.com/*
 // @grant        none
@@ -29,8 +29,8 @@
         ALPHA_THRESHOLD: 0.002,
         MAX_ALPHA: 0.99,
         LOGO_VALUE: 255,
-        DOM_SCAN_DEBOUNCE_MS: 120,
-        URL_PATTERN: /^https:\/\/lh3\.googleusercontent\.com\/rd-gg(?:-dl)?\/.+=s(?!0-d\?).*/
+        URL_PATTERN: /^https:\/\/lh3\.googleusercontent\.com\/rd-gg(?:-dl)?\/.+=s(?!0-d\?).*/,
+        DOWNLOAD_URL_PATTERN: /^https:\/\/lh3\.googleusercontent\.com\/rd-gg-dl\/.+=s(?!0-d\?).*/
     };
     const PRIMARY_MATCH_MIN_SCORES = {
         48: 0.75,
@@ -1148,18 +1148,14 @@
             this.originalFetch = window.fetch.bind(window);
             this.objectUrls = new Set();
             this.cleaningByUrl = new Map();
-            this.pendingDomScan = null;
-            this.observer = null;
             void this.init();
         }
         async init() {
             try {
-                this.engine = await WatermarkEngine.create();
                 this.setupNetworkInterceptor();
-                this.setupDOMObserver();
                 this.installPublicApi();
-                this.processExistingImages();
-                this.log('Ready. Monitoring Gemini images.');
+                this.setupObjectUrlCleanup();
+                this.log('Ready. Download cleanup is lazy; page images are not scanned.');
             } catch (error) {
                 console.error('[Gemini watermark remover] Init failed:', error);
             }
@@ -1178,11 +1174,16 @@
             if (input instanceof Request) return new Request(highResUrl, input);
             return input;
         }
+        async getEngine() {
+            if (!this.engine) this.engine = await WatermarkEngine.create();
+            return this.engine;
+        }
         installPublicApi() {
             window.geminiWatermarkRemover = Object.freeze({
                 rescan: () => this.processExistingImages(),
                 cleanBlob: (blob) => this.cleanImageBlob(blob, 'manual'),
                 stats: () => ({
+                    engineReady: Boolean(this.engine),
                     activeObjectUrls: this.objectUrls.size,
                     activeCleanups: this.cleaningByUrl.size,
                     templatesCached: TEMPLATE_CACHE.size,
@@ -1191,9 +1192,10 @@
             });
         }
         async cleanImageBlob(blob, label) {
+            const engine = await this.getEngine();
             const bitmap = await createImageBitmap(blob);
             try {
-                const result = await this.engine.processImage(bitmap, (match) => {
+                const result = await engine.processImage(bitmap, (match) => {
                     this.log(`${label}: locked ${match.logoSize}px at x:${match.x}, y:${match.y} (${(match.confidence * 100).toFixed(1)}%)`);
                 });
                 if (!result.changed || !result.canvas) return { blob, changed: false, plan: result.plan };
@@ -1212,6 +1214,12 @@
             this.cleaningByUrl.set(cleanUrl, cleanup);
             return cleanup;
         }
+        setupObjectUrlCleanup() {
+            window.addEventListener('pagehide', () => {
+                for (const objectUrl of this.objectUrls) URL.revokeObjectURL(objectUrl);
+                this.objectUrls.clear();
+            }, { once: true });
+        }
         setupNetworkInterceptor() {
             const originalFetch = this.originalFetch;
             window.fetch = async (input, init) => {
@@ -1220,10 +1228,10 @@
                     : input instanceof URL
                         ? input.href
                         : input?.url;
-                if (!url || !CONSTANTS.URL_PATTERN.test(url)) return originalFetch(input, init);
+                if (!url || !CONSTANTS.DOWNLOAD_URL_PATTERN.test(url)) return originalFetch(input, init);
                 const cleanUrl = this.cleanUrl(url);
                 const response = await originalFetch(this.buildFetchInput(input, cleanUrl), init);
-                if (!this.engine || !response.ok) return response;
+                if (!response.ok) return response;
                 const originalResponse = response.clone();
                 try {
                     const blob = await response.blob();
@@ -1258,7 +1266,7 @@
             if (img.srcset) img.srcset = objectUrl;
         }
         async processImageElement(img) {
-            if (!this.engine || img.dataset.gwrProcessed === 'true') return;
+            if (img.dataset.gwrProcessed === 'true') return;
             const currentUrl = img.currentSrc || img.src;
             if (!currentUrl || !CONSTANTS.URL_PATTERN.test(currentUrl)) return;
             if (!img.closest('generated-image, .generated-image-container')) return;
@@ -1271,7 +1279,7 @@
                     img.dataset.gwrStatus = 'fetch-failed';
                     return;
                 }
-                const result = await this.cleanBlobForUrl(cleanUrl, await response.blob(), 'cached image');
+                const result = await this.cleanBlobForUrl(cleanUrl, await response.blob(), 'manual image');
                 if (!result.changed) {
                     img.dataset.gwrStatus = 'unchanged';
                     return;
@@ -1283,38 +1291,6 @@
                 img.dataset.gwrStatus = 'failed';
                 console.warn('[Gemini watermark remover] Cached image processing failed:', error);
             }
-        }
-        cleanupRemovedNodes(nodes) {
-            for (const node of nodes) {
-                if (node.nodeType !== Node.ELEMENT_NODE) continue;
-                if (node.isConnected) continue;
-                if (node.matches?.('img[data-gwr-object-url]') && !node.isConnected) this.releaseImageObjectUrl(node);
-                node.querySelectorAll?.('img[data-gwr-object-url]').forEach((img) => {
-                    if (!img.isConnected) this.releaseImageObjectUrl(img);
-                });
-            }
-        }
-        scheduleProcessExistingImages() {
-            if (this.pendingDomScan !== null) return;
-            this.pendingDomScan = window.setTimeout(() => {
-                this.pendingDomScan = null;
-                this.processExistingImages();
-            }, CONSTANTS.DOM_SCAN_DEBOUNCE_MS);
-        }
-        setupDOMObserver() {
-            this.observer = new MutationObserver((mutations) => {
-                let shouldScan = false;
-                for (const mutation of mutations) {
-                    if (mutation.removedNodes.length > 0) this.cleanupRemovedNodes(mutation.removedNodes);
-                    if (mutation.addedNodes.length > 0) shouldScan = true;
-                }
-                if (shouldScan) this.scheduleProcessExistingImages();
-            });
-            this.observer.observe(document.body, { childList: true, subtree: true });
-            window.addEventListener('pagehide', () => {
-                for (const objectUrl of this.objectUrls) URL.revokeObjectURL(objectUrl);
-                this.objectUrls.clear();
-            }, { once: true });
         }
         processExistingImages() {
             const images = document.querySelectorAll('img[src*="googleusercontent.com"]:not([data-gwr-processed])');

@@ -22,6 +22,8 @@
 ## Verification Rules
 
 - Never claim the watermark is removed from logs alone.
+- For userscript performance issues, verify the script does not start page-wide DOM scanning, eager image cleanup, or expensive template initialization during normal Gemini page load.
+- Keep cleanup lazy by default: downloads/manual `cleanBlob()` may run the remover, but normal chat/image-generation UI must stay untouched unless the user explicitly opts into `rescan()`.
 - For Gemini samples, verify all of these before closing:
   1. Run the CLI on the original image.
   2. Inspect a direct bottom-right crop of the output.
