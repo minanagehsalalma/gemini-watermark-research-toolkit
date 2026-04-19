@@ -4,6 +4,8 @@ outputs/
 TestSet/
 perplexity.log
 testimage.png
+Gemini_Generated_Image_*.png
+failing-sample-cleaned-*.png
 
 *.log
 *.debug.png

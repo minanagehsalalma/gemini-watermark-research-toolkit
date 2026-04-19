@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { PNG } = require('pngjs');
+const { findWatermarkSparkles } = require('./detect-gemini-watermark.js');
 
 // Constants for pixel subtraction matching Real.js
 const CONSTANTS = {
@@ -19,10 +20,11 @@ const PRIMARY_MATCH_MIN_SCORES = {
 };
 const DEFAULT_PLACEMENT_MIN_SCORES = {
   48: 0.64,
-  96: 0.75,
+  96: 0.58,
 };
 const SECONDARY_MATCH_RATIO = 0.75;
 const TEMPLATE_CACHE = new Map();
+const SCALED_TEMPLATE_CACHE = new Map();
 let OPENCV_PYTHON_RUNTIME;
 const RESIDUAL_HEAL_CONFIG = {
   grayThreshold: 212,
@@ -102,6 +104,41 @@ function calculateAlphaMap(logoPng) {
   return alphaMap;
 }
 
+function resizeAlphaMap(alphaMap, sourceSize, targetSize) {
+  if (sourceSize === targetSize) {
+    return new Float32Array(alphaMap);
+  }
+
+  const scaled = new Float32Array(targetSize * targetSize);
+  const sourceLast = Math.max(1, sourceSize - 1);
+  const targetLast = Math.max(1, targetSize - 1);
+
+  for (let y = 0; y < targetSize; y += 1) {
+    const srcY = (y / targetLast) * sourceLast;
+    const y0 = Math.floor(srcY);
+    const y1 = Math.min(sourceSize - 1, y0 + 1);
+    const wy = srcY - y0;
+
+    for (let x = 0; x < targetSize; x += 1) {
+      const srcX = (x / targetLast) * sourceLast;
+      const x0 = Math.floor(srcX);
+      const x1 = Math.min(sourceSize - 1, x0 + 1);
+      const wx = srcX - x0;
+
+      const a00 = alphaMap[y0 * sourceSize + x0];
+      const a10 = alphaMap[y0 * sourceSize + x1];
+      const a01 = alphaMap[y1 * sourceSize + x0];
+      const a11 = alphaMap[y1 * sourceSize + x1];
+
+      const top = a00 * (1 - wx) + a10 * wx;
+      const bottom = a01 * (1 - wx) + a11 * wx;
+      scaled[y * targetSize + x] = top * (1 - wy) + bottom * wy;
+    }
+  }
+
+  return scaled;
+}
+
 async function getAlphaTemplate(logoSize) {
   if (TEMPLATE_CACHE.has(logoSize)) {
     return TEMPLATE_CACHE.get(logoSize);
@@ -115,6 +152,21 @@ async function getAlphaTemplate(logoSize) {
   };
 
   TEMPLATE_CACHE.set(logoSize, template);
+  return template;
+}
+
+async function getScaledAlphaTemplate(baseSize, targetSize) {
+  const key = `${baseSize}:${targetSize}`;
+  if (SCALED_TEMPLATE_CACHE.has(key)) {
+    return SCALED_TEMPLATE_CACHE.get(key);
+  }
+
+  const baseTemplate = await getAlphaTemplate(baseSize);
+  const template = {
+    logoSize: targetSize,
+    alphaMap: resizeAlphaMap(baseTemplate.alphaMap, baseSize, targetSize),
+  };
+  SCALED_TEMPLATE_CACHE.set(key, template);
   return template;
 }
 
@@ -163,6 +215,32 @@ function isDefaultPlacementMatch(png, match, logoSize) {
     Math.abs(rightMargin - expectedMargin) <= tolerance &&
     Math.abs(bottomMargin - expectedMargin) <= tolerance
   );
+}
+
+function isNearCornerPlacement(png, match, logoSize) {
+  if (!match || !Number.isFinite(match.x) || !Number.isFinite(match.y)) {
+    return false;
+  }
+
+  const rightMargin = png.width - (match.x + logoSize);
+  const bottomMargin = png.height - (match.y + logoSize);
+  const marginLimitX = Math.max(96, Math.floor(png.width * 0.12));
+  const marginLimitY = Math.max(96, Math.floor(png.height * 0.12));
+
+  return rightMargin >= 0 && bottomMargin >= 0 &&
+    rightMargin <= marginLimitX &&
+    bottomMargin <= marginLimitY;
+}
+
+function getCornerSearchBounds(png, logoSize) {
+  const searchWidth = Math.max(192, Math.floor(png.width * 0.18), logoSize * 4 + 32);
+  const searchHeight = Math.max(192, Math.floor(png.height * 0.18), logoSize * 4 + 32);
+  return {
+    startX: Math.max(0, png.width - searchWidth - logoSize),
+    startY: Math.max(0, png.height - searchHeight - logoSize),
+    endX: png.width - logoSize,
+    endY: png.height - logoSize,
+  };
 }
 
 function resolveOpenCvPythonRuntime() {
@@ -505,6 +583,124 @@ function fillMaskFromPlanes(png, x0, y0, width, height, box, mask) {
       }
     }
   }
+}
+
+function fillMaskByRowInterpolation(png, x0, y0, width, height, box, mask) {
+  const sampleOffset = 8;
+  for (let y = box.y0; y <= box.y1; y += 1) {
+    let x = box.x0;
+    while (x <= box.x1) {
+      if (!mask[y * width + x]) {
+        x += 1;
+        continue;
+      }
+
+      const runStart = x;
+      while (x <= box.x1 && mask[y * width + x]) {
+        x += 1;
+      }
+      const runEnd = x - 1;
+
+      let sourceLeft = runStart - 1;
+      while (sourceLeft >= 0 && mask[y * width + sourceLeft]) {
+        sourceLeft -= 1;
+      }
+      if (sourceLeft >= 0) {
+        sourceLeft = Math.max(0, sourceLeft - sampleOffset);
+      }
+
+      let sourceRight = runEnd + 1;
+      while (sourceRight < width && mask[y * width + sourceRight]) {
+        sourceRight += 1;
+      }
+      if (sourceRight < width) {
+        sourceRight = Math.min(width - 1, sourceRight + sampleOffset);
+      }
+
+      for (let fillX = runStart; fillX <= runEnd; fillX += 1) {
+        const dstIdx = ((y0 + y) * png.width + (x0 + fillX)) << 2;
+        for (let channel = 0; channel < 3; channel += 1) {
+          let value = 0;
+          if (sourceLeft >= 0 && sourceRight < width) {
+            const leftIdx = ((y0 + y) * png.width + (x0 + sourceLeft)) << 2;
+            const rightIdx = ((y0 + y) * png.width + (x0 + sourceRight)) << 2;
+            const span = Math.max(1, sourceRight - sourceLeft);
+            const t = (fillX - sourceLeft) / span;
+            value = Math.round((png.data[leftIdx + channel] * (1 - t)) + (png.data[rightIdx + channel] * t));
+          } else if (sourceLeft >= 0) {
+            const leftIdx = ((y0 + y) * png.width + (x0 + sourceLeft)) << 2;
+            value = png.data[leftIdx + channel];
+          } else if (sourceRight < width) {
+            const rightIdx = ((y0 + y) * png.width + (x0 + sourceRight)) << 2;
+            value = png.data[rightIdx + channel];
+          } else {
+            value = png.data[dstIdx + channel];
+          }
+          png.data[dstIdx + channel] = value;
+        }
+      }
+    }
+  }
+}
+
+function healScaledTemplateMatch(png, match) {
+  if (!match || match.logoSize === 48 || match.logoSize === 96 || !match.alphaMap) {
+    return false;
+  }
+
+  const alphaThreshold = 0.015;
+  const dilateRadius = Math.max(4, Math.floor(match.logoSize * 0.08));
+  const boxPadding = dilateRadius + 2;
+  const pad = 8;
+  const x0 = Math.max(0, match.x - pad);
+  const y0 = Math.max(0, match.y - pad);
+  const x1 = Math.min(png.width - 1, match.x + match.logoSize - 1 + pad);
+  const y1 = Math.min(png.height - 1, match.y + match.logoSize - 1 + pad);
+  const width = x1 - x0 + 1;
+  const height = y1 - y0 + 1;
+  const mask = new Uint8Array(width * height);
+  const maskPixels = [];
+  let maskX0 = width;
+  let maskY0 = height;
+  let maskX1 = -1;
+  let maskY1 = -1;
+
+  for (let row = 0; row < match.logoSize; row += 1) {
+    for (let col = 0; col < match.logoSize; col += 1) {
+      const alpha = match.alphaMap[(row * match.logoSize) + col];
+      if (alpha < alphaThreshold) {
+        continue;
+      }
+
+      const localX = (match.x - x0) + col;
+      const localY = (match.y - y0) + row;
+      if (localX < 0 || localY < 0 || localX >= width || localY >= height) {
+        continue;
+      }
+
+      mask[localY * width + localX] = 1;
+      maskPixels.push([localX, localY]);
+      if (localX < maskX0) maskX0 = localX;
+      if (localY < maskY0) maskY0 = localY;
+      if (localX > maskX1) maskX1 = localX;
+      if (localY > maskY1) maskY1 = localY;
+    }
+  }
+
+  if (maskPixels.length === 0) {
+    return false;
+  }
+
+  const dilatedMask = buildDilatedMask(width, height, maskPixels, dilateRadius);
+  const box = {
+    x0: Math.max(0, maskX0 - boxPadding),
+    y0: Math.max(0, maskY0 - boxPadding),
+    x1: Math.min(width - 1, maskX1 + boxPadding),
+    y1: Math.min(height - 1, maskY1 + boxPadding),
+  };
+
+  fillMaskByRowInterpolation(png, x0, y0, width, height, box, dilatedMask);
+  return true;
 }
 
 function findLowContrastResidualComponents(png, x0, y0, width, height) {
@@ -1056,15 +1252,27 @@ async function planWatermarkRemoval(png) {
   let lastMatch96 = { x: 0, y: 0, score: -Infinity };
 
   for (let index = 0; index < maxMatches; index += 1) {
-    const match48 = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, { gray, suppressed });
-    const match96 = findWatermarkNCC(png, template96.alphaMap, template96.logoSize, { gray, suppressed });
+    const match48 = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, {
+      gray,
+      suppressed,
+      ...getCornerSearchBounds(png, template48.logoSize),
+    });
+    const match96 = findWatermarkNCC(png, template96.alphaMap, template96.logoSize, {
+      gray,
+      suppressed,
+      ...getCornerSearchBounds(png, template96.logoSize),
+    });
     lastMatch48 = match48;
     lastMatch96 = match96;
 
     let chosen = null;
     const primary96Threshold = PRIMARY_MATCH_MIN_SCORES[96];
     const primary48Threshold = PRIMARY_MATCH_MIN_SCORES[48];
-    const acceptPrimary96 = match96.score > primary96Threshold;
+    const acceptPrimary96 = match96.score > primary96Threshold || (
+      primaryConfidence === null &&
+      match96.score > DEFAULT_PLACEMENT_MIN_SCORES[96] &&
+      isDefaultPlacementMatch(png, match96, template96.logoSize)
+    );
     const acceptPrimary48 = match48.score > primary48Threshold || (
       primaryConfidence === null &&
       match48.score > DEFAULT_PLACEMENT_MIN_SCORES[48] &&
@@ -1123,6 +1331,112 @@ async function planWatermarkRemoval(png) {
 
   const rawConfidence = Math.max(lastMatch48.score, lastMatch96.score);
   const confidence = Number.isFinite(rawConfidence) ? rawConfidence : 0;
+  const default48X = png.width - template48.logoSize - 32;
+  const default48Y = png.height - template48.logoSize - 32;
+  const default96X = png.width - template96.logoSize - 64;
+  const default96Y = png.height - template96.logoSize - 64;
+  const default48Score = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, {
+    gray,
+    startX: default48X,
+    endX: default48X,
+    startY: default48Y,
+    endY: default48Y,
+  });
+  const default96Score = findWatermarkNCC(png, template96.alphaMap, template96.logoSize, {
+    gray,
+    startX: default96X,
+    endX: default96X,
+    startY: default96Y,
+    endY: default96Y,
+  });
+  if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
+    const chosen = default96Score.score >= default48Score.score
+      ? {
+          x: default96X,
+          y: default96Y,
+          bbox: createBounds(default96X, default96Y, template96.logoSize),
+          logoSize: template96.logoSize,
+          alphaMap: template96.alphaMap,
+          confidence: default96Score.score,
+        }
+      : {
+          x: default48X,
+          y: default48Y,
+          bbox: createBounds(default48X, default48Y, template48.logoSize),
+          logoSize: template48.logoSize,
+          alphaMap: template48.alphaMap,
+          confidence: default48Score.score,
+        };
+    console.log(`✓ Locked ${chosen.logoSize}px default-placement template at x:${chosen.x}, y:${chosen.y} (Confidence: ${(chosen.confidence * 100).toFixed(1)}%)`);
+    return {
+      found: true,
+      x: chosen.x,
+      y: chosen.y,
+      logoSize: chosen.logoSize,
+      alphaMap: chosen.alphaMap,
+      confidence: chosen.confidence,
+      matches: [chosen],
+      match48: lastMatch48,
+      match96: lastMatch96,
+    };
+  }
+
+  try {
+    const detectorResult = findWatermarkSparkles(png);
+    const detectorPrimary = detectorResult.sparkles[0];
+    const detectedSize = Math.max(40, Math.min(72, detectorPrimary.size));
+    if (detectedSize >= 56 && detectedSize <= 72 && detectorPrimary.edgeTouch.right && !detectorPrimary.edgeTouch.bottom) {
+      throw new Error('Skip clipped right-edge scaled fallback');
+    }
+    const baseSize = detectedSize <= 72 ? 48 : 96;
+    const scaledTemplate = await getScaledAlphaTemplate(baseSize, detectedSize);
+    const refined = findWatermarkNCC(png, scaledTemplate.alphaMap, scaledTemplate.logoSize, {
+      gray,
+      startX: Math.max(0, detectorPrimary.bbox.x0 - 20),
+      startY: Math.max(0, detectorPrimary.bbox.y0 - 20),
+      endX: Math.min(png.width - scaledTemplate.logoSize, detectorPrimary.bbox.x1 + 20),
+      endY: Math.min(png.height - scaledTemplate.logoSize, detectorPrimary.bbox.y1 + 20),
+    });
+
+    const refinedUsable = Number.isFinite(refined.score) && refined.score >= 0.35;
+    const fallbackCandidate = refinedUsable
+      ? refined
+      : {
+          x: detectorPrimary.bbox.x0,
+          y: detectorPrimary.bbox.y0,
+          bbox: createBounds(detectorPrimary.bbox.x0, detectorPrimary.bbox.y0, scaledTemplate.logoSize),
+          score: detectorResult.confidence,
+        };
+
+    const detectorReliable =
+      detectorResult.confidence >= 0.72 &&
+      detectorPrimary.geometry >= 0.5 &&
+      detectorPrimary.requiredArmCoverage >= 0.7;
+    if (isNearCornerPlacement(png, fallbackCandidate, scaledTemplate.logoSize) && (refinedUsable || detectorReliable)) {
+      console.log(`✓ Locked ${scaledTemplate.logoSize}px detector-guided template at x:${fallbackCandidate.x}, y:${fallbackCandidate.y} (Confidence: ${(fallbackCandidate.score * 100).toFixed(1)}%)`);
+      return {
+        found: true,
+        x: fallbackCandidate.x,
+        y: fallbackCandidate.y,
+        logoSize: scaledTemplate.logoSize,
+        alphaMap: scaledTemplate.alphaMap,
+        confidence: fallbackCandidate.score,
+        matches: [{
+          x: fallbackCandidate.x,
+          y: fallbackCandidate.y,
+          bbox: fallbackCandidate.bbox,
+          logoSize: scaledTemplate.logoSize,
+          alphaMap: scaledTemplate.alphaMap,
+          confidence: fallbackCandidate.score,
+        }],
+        match48: lastMatch48,
+        match96: lastMatch96,
+      };
+    }
+  } catch (error) {
+    // Keep the remover deterministic even if the geometric fallback cannot isolate a corner sparkle.
+  }
+
   return {
     found: false,
     x: null,
@@ -1189,6 +1503,69 @@ async function removeWatermark(png) {
         }
       }
     }
+  }
+
+  healScaledTemplateMatch(png, plan.matches[0]);
+
+  try {
+    const detectorResult = findWatermarkSparkles(png);
+    const sparkle = detectorResult.sparkles[0];
+    const residualSize = Math.max(24, Math.min(48, sparkle.size));
+    const residualCandidate = {
+      x: sparkle.bbox.x0,
+      y: sparkle.bbox.y0,
+    };
+
+    if (
+      isNearCornerPlacement(png, residualCandidate, residualSize) &&
+      detectorResult.confidence >= 0.62 &&
+      sparkle.geometry >= 0.55
+    ) {
+      const pad = 12;
+      const x0 = Math.max(0, sparkle.bbox.x0 - pad);
+      const y0 = Math.max(0, sparkle.bbox.y0 - pad);
+      const x1 = Math.min(png.width - 1, sparkle.bbox.x1 + pad);
+      const y1 = Math.min(png.height - 1, sparkle.bbox.y1 + pad);
+      const width = x1 - x0 + 1;
+      const height = y1 - y0 + 1;
+      const mask = new Uint8Array(width * height);
+      const rectX0 = Math.max(0, sparkle.bbox.x0 - x0 - 4);
+      const rectY0 = Math.max(0, sparkle.bbox.y0 - y0 - 4);
+      const rectX1 = Math.min(width - 1, sparkle.bbox.x1 - x0 + 4);
+      const rectY1 = Math.min(height - 1, sparkle.bbox.y1 - y0 + 4);
+      const box = { x0: rectX0, y0: rectY0, x1: rectX1, y1: rectY1 };
+      for (let y = rectY0; y <= rectY1; y += 1) {
+        for (let x = rectX0; x <= rectX1; x += 1) {
+          mask[y * width + x] = 1;
+        }
+      }
+
+      const touchesRightEdge = sparkle.bbox.x1 >= png.width - 20;
+      const touchesBottomEdge = sparkle.bbox.y1 >= png.height - 20;
+      if (touchesRightEdge || touchesBottomEdge) {
+        const edgeRectX0 = Math.max(0, sparkle.bbox.x0 - x0 - 2);
+        const edgeRectY0 = Math.max(0, sparkle.bbox.y0 - y0 - 2);
+        const edgeRectX1 = Math.min(width - 1, sparkle.bbox.x1 - x0 + 6);
+        const edgeRectY1 = Math.min(height - 1, sparkle.bbox.y1 - y0 + 6);
+        for (let y = edgeRectY0; y <= edgeRectY1; y += 1) {
+          for (let x = edgeRectX0; x <= edgeRectX1; x += 1) {
+            mask[y * width + x] = 1;
+          }
+        }
+        box.x0 = Math.min(box.x0, edgeRectX0);
+        box.y0 = Math.min(box.y0, edgeRectY0);
+        box.x1 = Math.max(box.x1, edgeRectX1);
+        box.y1 = Math.max(box.y1, edgeRectY1);
+      }
+      if (touchesRightEdge || touchesBottomEdge) {
+        fillMaskByRowInterpolation(png, x0, y0, width, height, box, mask);
+      } else {
+        fillMaskFromPlanes(png, x0, y0, width, height, box, mask);
+      }
+
+    }
+  } catch (error) {
+    // Ignore post-cleanup detector failures.
   }
 
   await healResidualCornerSparkle(png, plan.matches[0]);
