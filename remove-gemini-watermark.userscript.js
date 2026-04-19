@@ -6,7 +6,7 @@
 //
 //              (watermark still shows in the chat)
 // @namespace    mina-nageh
-// @version      2.3.0
+// @version      2.3.1
 // @author       mina nageh
 // @match        https://gemini.google.com/*
 // @grant        none
@@ -942,6 +942,31 @@
         let primaryConfidence = null;
         let lastMatch48 = { score: -Infinity };
         let lastMatch96 = { score: -Infinity };
+        const default48X = png.width - 48 - 32;
+        const default48Y = png.height - 48 - 32;
+        const default96X = png.width - 96 - 64;
+        const default96Y = png.height - 96 - 64;
+        const default48Score = findWatermarkNCC(png, template48, {
+            gray,
+            startX: default48X,
+            endX: default48X,
+            startY: default48Y,
+            endY: default48Y
+        });
+        const default96Score = findWatermarkNCC(png, template96, {
+            gray,
+            startX: default96X,
+            endX: default96X,
+            startY: default96Y,
+            endY: default96Y
+        });
+        if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
+            const chosen = default96Score.score >= default48Score.score
+                ? { x: default96X, y: default96Y, bbox: createBounds(default96X, default96Y, 96), logoSize: 96, alphaMap: template96.alphaMap, confidence: default96Score.score, source: 'default-placement' }
+                : { x: default48X, y: default48Y, bbox: createBounds(default48X, default48Y, 48), logoSize: 48, alphaMap: template48.alphaMap, confidence: default48Score.score, source: 'default-placement' };
+            onMatch(chosen);
+            return { found: true, matches: [chosen], confidence: chosen.confidence };
+        }
         for (let index = 0; index < 4; index += 1) {
             const match48 = findWatermarkNCC(png, template48, {
                 gray,
@@ -985,31 +1010,6 @@
         }
         if (matches.length) return { found: true, matches, confidence: matches[0].confidence };
         const confidence = Math.max(lastMatch48.score, lastMatch96.score);
-        const default48X = png.width - 48 - 32;
-        const default48Y = png.height - 48 - 32;
-        const default96X = png.width - 96 - 64;
-        const default96Y = png.height - 96 - 64;
-        const default48Score = findWatermarkNCC(png, template48, {
-            gray,
-            startX: default48X,
-            endX: default48X,
-            startY: default48Y,
-            endY: default48Y
-        });
-        const default96Score = findWatermarkNCC(png, template96, {
-            gray,
-            startX: default96X,
-            endX: default96X,
-            startY: default96Y,
-            endY: default96Y
-        });
-        if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
-            const chosen = default96Score.score >= default48Score.score
-                ? { x: default96X, y: default96Y, bbox: createBounds(default96X, default96Y, 96), logoSize: 96, alphaMap: template96.alphaMap, confidence: default96Score.score }
-                : { x: default48X, y: default48Y, bbox: createBounds(default48X, default48Y, 48), logoSize: 48, alphaMap: template48.alphaMap, confidence: default48Score.score };
-            onMatch(chosen);
-            return { found: true, matches: [chosen], confidence: chosen.confidence };
-        }
         try {
             const detectorResult = findWatermarkSparkles(png);
             const detectorPrimary = detectorResult.sparkles[0];
@@ -1137,7 +1137,9 @@
             if (!plan.found) return { changed: false, canvas: null, plan };
             for (const match of plan.matches) applySubtraction(png, match);
             healScaledTemplateMatch(png, plan.matches[0]);
-            await runDetectorResidualCleanup(png);
+            if (plan.matches[0]?.source !== 'default-placement') {
+                await runDetectorResidualCleanup(png);
+            }
             healResidualCorner(png, plan.matches[0]);
             return { changed: true, canvas: canvasFromRaster(png), plan };
         }

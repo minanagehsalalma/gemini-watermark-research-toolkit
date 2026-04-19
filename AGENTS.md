@@ -16,6 +16,7 @@
 
 - Do not trust a clipped right-edge `56px-72px` detector-guided fallback by default. In this repo that case has produced false positives on already-clean outputs.
 - Prefer exact/default-placement matches first.
+- Keep fixed Gemini default-placement checks before broad NCC/detector scans. The fixed check is the fast download path.
 - Keep the CLI and userscript matching policy in sync. If one gets a fallback or threshold change, port it to the other in the same pass.
 - When changing fallback order or thresholds, test both the normal exact match path and the detector-guided path.
 

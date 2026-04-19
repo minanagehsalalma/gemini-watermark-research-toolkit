@@ -1251,6 +1251,58 @@ async function planWatermarkRemoval(png) {
   let lastMatch48 = { x: 0, y: 0, score: -Infinity };
   let lastMatch96 = { x: 0, y: 0, score: -Infinity };
 
+  const default48X = png.width - template48.logoSize - 32;
+  const default48Y = png.height - template48.logoSize - 32;
+  const default96X = png.width - template96.logoSize - 64;
+  const default96Y = png.height - template96.logoSize - 64;
+  const default48Score = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, {
+    gray,
+    startX: default48X,
+    endX: default48X,
+    startY: default48Y,
+    endY: default48Y,
+  });
+  const default96Score = findWatermarkNCC(png, template96.alphaMap, template96.logoSize, {
+    gray,
+    startX: default96X,
+    endX: default96X,
+    startY: default96Y,
+    endY: default96Y,
+  });
+  if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
+    const chosen = default96Score.score >= default48Score.score
+      ? {
+          x: default96X,
+          y: default96Y,
+          bbox: createBounds(default96X, default96Y, template96.logoSize),
+          logoSize: template96.logoSize,
+          alphaMap: template96.alphaMap,
+          confidence: default96Score.score,
+          source: 'default-placement',
+        }
+      : {
+          x: default48X,
+          y: default48Y,
+          bbox: createBounds(default48X, default48Y, template48.logoSize),
+          logoSize: template48.logoSize,
+          alphaMap: template48.alphaMap,
+          confidence: default48Score.score,
+          source: 'default-placement',
+        };
+    console.log(`✓ Locked ${chosen.logoSize}px default-placement template at x:${chosen.x}, y:${chosen.y} (Confidence: ${(chosen.confidence * 100).toFixed(1)}%)`);
+    return {
+      found: true,
+      x: chosen.x,
+      y: chosen.y,
+      logoSize: chosen.logoSize,
+      alphaMap: chosen.alphaMap,
+      confidence: chosen.confidence,
+      matches: [chosen],
+      match48: lastMatch48,
+      match96: lastMatch96,
+    };
+  }
+
   for (let index = 0; index < maxMatches; index += 1) {
     const match48 = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, {
       gray,
@@ -1331,56 +1383,6 @@ async function planWatermarkRemoval(png) {
 
   const rawConfidence = Math.max(lastMatch48.score, lastMatch96.score);
   const confidence = Number.isFinite(rawConfidence) ? rawConfidence : 0;
-  const default48X = png.width - template48.logoSize - 32;
-  const default48Y = png.height - template48.logoSize - 32;
-  const default96X = png.width - template96.logoSize - 64;
-  const default96Y = png.height - template96.logoSize - 64;
-  const default48Score = findWatermarkNCC(png, template48.alphaMap, template48.logoSize, {
-    gray,
-    startX: default48X,
-    endX: default48X,
-    startY: default48Y,
-    endY: default48Y,
-  });
-  const default96Score = findWatermarkNCC(png, template96.alphaMap, template96.logoSize, {
-    gray,
-    startX: default96X,
-    endX: default96X,
-    startY: default96Y,
-    endY: default96Y,
-  });
-  if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
-    const chosen = default96Score.score >= default48Score.score
-      ? {
-          x: default96X,
-          y: default96Y,
-          bbox: createBounds(default96X, default96Y, template96.logoSize),
-          logoSize: template96.logoSize,
-          alphaMap: template96.alphaMap,
-          confidence: default96Score.score,
-        }
-      : {
-          x: default48X,
-          y: default48Y,
-          bbox: createBounds(default48X, default48Y, template48.logoSize),
-          logoSize: template48.logoSize,
-          alphaMap: template48.alphaMap,
-          confidence: default48Score.score,
-        };
-    console.log(`✓ Locked ${chosen.logoSize}px default-placement template at x:${chosen.x}, y:${chosen.y} (Confidence: ${(chosen.confidence * 100).toFixed(1)}%)`);
-    return {
-      found: true,
-      x: chosen.x,
-      y: chosen.y,
-      logoSize: chosen.logoSize,
-      alphaMap: chosen.alphaMap,
-      confidence: chosen.confidence,
-      matches: [chosen],
-      match48: lastMatch48,
-      match96: lastMatch96,
-    };
-  }
-
   try {
     const detectorResult = findWatermarkSparkles(png);
     const detectorPrimary = detectorResult.sparkles[0];
