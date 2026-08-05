@@ -1,16 +1,16 @@
 // ==UserScript==
 // @name         Gemini watermark remover
-// @description Removes Gemini's sparkle watermark from downloaded/generated images in-browser.
+// @description Removes Gemini's sparkle watermark from downloaded or copied generated images in-browser.
 //
-//              Download or copy the full resolution image and the watermark is removed!
-//
-//              (watermark still shows in the chat)
+//              Cleans downloads, clipboard copies, and visible Gemini image previews locally.
 // @namespace    mina-nageh
-// @version      2.3.1
+// @version      2.15.0
 // @author       mina nageh
 // @match        https://gemini.google.com/*
+// @require      https://cdn.jsdelivr.net/gh/antimatter15/inpaint.js@e77a5305e997464e23bd650085121322a1b565dc/heapqueue.js
+// @require      https://cdn.jsdelivr.net/gh/antimatter15/inpaint.js@e77a5305e997464e23bd650085121322a1b565dc/inpaint.js
 // @grant        none
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 (function () {
     'use strict';
@@ -29,8 +29,8 @@
         ALPHA_THRESHOLD: 0.002,
         MAX_ALPHA: 0.99,
         LOGO_VALUE: 255,
-        URL_PATTERN: /^https:\/\/lh3\.googleusercontent\.com\/rd-gg(?:-dl)?\/.+=s(?!0-d\?).*/,
-        DOWNLOAD_URL_PATTERN: /^https:\/\/lh3\.googleusercontent\.com\/rd-gg-dl\/.+=s(?!0-d\?).*/
+        URL_PATTERN: /^https:\/\/(?:[^/]+\.)?googleusercontent\.com\/rd-gg(?:-dl)?\//,
+        DOWNLOAD_URL_PATTERN: /^https:\/\/(?:[^/]+\.)?googleusercontent\.com\/rd-gg-dl\//
     };
     const PRIMARY_MATCH_MIN_SCORES = {
         48: 0.75,
@@ -40,10 +40,18 @@
         48: 0.64,
         96: 0.58
     };
+    const SCALED_MATCH_SIZES = [56, 64, 72, 80, 88];
+    const SCALED_MATCH_MIN_SCORE = 0.57;
+    const SCALED_MATCH_ADVANTAGE = 0.1;
+    const NEAR_CORNER_MIN_SCORES = { 48: 0.52, 96: 0.52 };
+    const DETECTOR_GUIDED_MIN_SCORE = 0.57;
     const SECONDARY_MATCH_RATIO = 0.75;
+    const FULL_SIZE_WAIT_TIMEOUT_MS = 6000;
+    const CLIPBOARD_WAIT_TIMEOUT_MS = 10000;
     const TEMPLATE_CACHE = new Map();
     const SCALED_TEMPLATE_CACHE = new Map();
     const SPARKLE_TEMPLATE_CACHE = new Map();
+    let reconstructionWorkerPolicy = null;
     const RESIDUAL_HEAL_CONFIG = {
         grayThreshold: 212,
         saturationThreshold: 18,
@@ -118,6 +126,41 @@
             endY: png.height - logoSize
         };
     }
+    function getNearCornerSearchBounds(png, logoSize) {
+        const marginLimitX = Math.max(96, Math.floor(png.width * 0.12));
+        const marginLimitY = Math.max(96, Math.floor(png.height * 0.12));
+        return {
+            startX: Math.max(0, png.width - marginLimitX - logoSize),
+            startY: Math.max(0, png.height - marginLimitY - logoSize),
+            endX: png.width - logoSize,
+            endY: png.height - logoSize
+        };
+    }
+    function getDownscaledPreviewSearchBounds(png, logoSize) {
+        const expectedX = png.width - logoSize - Math.round(png.width * 3 / 32);
+        const expectedY = png.height - logoSize - Math.round(png.height * 3 / 32);
+        const radius = Math.max(12, Math.round(logoSize / 4));
+        return {
+            startX: Math.max(0, expectedX - radius),
+            startY: Math.max(0, expectedY - radius),
+            endX: Math.min(png.width - logoSize, expectedX + radius),
+            endY: Math.min(png.height - logoSize, expectedY + radius)
+        };
+    }
+    function getLocalScaleSearchBounds(png, logoSize, referenceMatch) {
+        const nearCorner = getNearCornerSearchBounds(png, logoSize);
+        const centerX = referenceMatch.x + referenceMatch.logoSize / 2;
+        const centerY = referenceMatch.y + referenceMatch.logoSize / 2;
+        const expectedX = Math.round(centerX - logoSize / 2);
+        const expectedY = Math.round(centerY - logoSize / 2);
+        const radius = Math.max(24, Math.floor(logoSize / 3));
+        return {
+            startX: clamp(expectedX - radius, nearCorner.startX, nearCorner.endX),
+            startY: clamp(expectedY - radius, nearCorner.startY, nearCorner.endY),
+            endX: clamp(expectedX + radius, nearCorner.startX, nearCorner.endX),
+            endY: clamp(expectedY + radius, nearCorner.startY, nearCorner.endY)
+        };
+    }
     function getSparkleSearchBounds(png) {
         const searchWidth = Math.max(192, Math.floor(png.width * 0.18));
         const searchHeight = Math.max(192, Math.floor(png.height * 0.18));
@@ -135,7 +178,9 @@
         return canvas;
     }
     function rasterFromImage(imgSource) {
-        const canvas = createCanvas(imgSource.width, imgSource.height);
+        const width = imgSource.naturalWidth || imgSource.videoWidth || imgSource.width;
+        const height = imgSource.naturalHeight || imgSource.videoHeight || imgSource.height;
+        const canvas = createCanvas(width, height);
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         ctx.drawImage(imgSource, 0, 0);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -408,11 +453,16 @@
             }
         }
     }
-    function healScaledTemplateMatch(png, match) {
-        if (!match || match.logoSize === 48 || match.logoSize === 96 || !match.alphaMap) return false;
+    async function healScaledTemplateMatch(png, match) {
+        const requiresMaskHealing = [
+            'scaled-search',
+            'near-corner-search',
+            'geometry-placement-search',
+            'downscaled-preview-placement-search'
+        ].includes(match?.source);
+        if (!match || (!requiresMaskHealing && (match.logoSize === 48 || match.logoSize === 96)) || !match.alphaMap) return false;
         const alphaThreshold = 0.015;
-        const dilateRadius = Math.max(4, Math.floor(match.logoSize * 0.08));
-        const boxPadding = dilateRadius + 2;
+        const dilateRadius = Math.max(1, Math.floor(match.logoSize * 0.015));
         const pad = 8;
         const x0 = Math.max(0, match.x - pad);
         const y0 = Math.max(0, match.y - pad);
@@ -421,7 +471,7 @@
         const width = x1 - x0 + 1;
         const height = y1 - y0 + 1;
         const mask = new Uint8Array(width * height);
-        let maskX0 = width, maskY0 = height, maskX1 = -1, maskY1 = -1;
+        const maskPixels = [];
         for (let row = 0; row < match.logoSize; row += 1) {
             for (let col = 0; col < match.logoSize; col += 1) {
                 const alpha = match.alphaMap[row * match.logoSize + col];
@@ -430,21 +480,56 @@
                 const localY = match.y - y0 + row;
                 if (localX < 0 || localY < 0 || localX >= width || localY >= height) continue;
                 mask[localY * width + localX] = 1;
-                if (localX < maskX0) maskX0 = localX;
-                if (localY < maskY0) maskY0 = localY;
-                if (localX > maskX1) maskX1 = localX;
-                if (localY > maskY1) maskY1 = localY;
+                maskPixels.push([localX, localY]);
             }
         }
-        if (maskX1 < 0 || maskY1 < 0) return false;
+        if (maskPixels.length === 0) return false;
         const dilatedMask = dilateMask(mask, width, height, dilateRadius);
-        const box = {
-            x0: Math.max(0, maskX0 - boxPadding),
-            y0: Math.max(0, maskY0 - boxPadding),
-            x1: Math.min(width - 1, maskX1 + boxPadding),
-            y1: Math.min(height - 1, maskY1 + boxPadding)
-        };
-        fillMaskByRowInterpolation(png, x0, y0, width, height, box, dilatedMask);
+        const snapshot = match.watermarkedRegion;
+        if (!snapshot || snapshot.x0 !== x0 || snapshot.y0 !== y0 || snapshot.width !== width || snapshot.height !== height) {
+            match.reconstruction = { ...inpaintMaskStructureAware(png, x0, y0, width, height, dilatedMask), workerUsed: false };
+            return true;
+        }
+        const subtractedRgb = new Uint8ClampedArray(width * height * 3);
+        const alphaRegion = new Float32Array(width * height);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                const targetOffset = ((y * width) + x) * 3;
+                subtractedRgb[targetOffset] = png.data[sourceOffset];
+                subtractedRgb[targetOffset + 1] = png.data[sourceOffset + 1];
+                subtractedRgb[targetOffset + 2] = png.data[sourceOffset + 2];
+            }
+        }
+        for (let row = 0; row < match.logoSize; row += 1) {
+            for (let col = 0; col < match.logoSize; col += 1) {
+                const localX = match.x - x0 + col;
+                const localY = match.y - y0 + row;
+                if (localX < 0 || localY < 0 || localX >= width || localY >= height) continue;
+                alphaRegion[localY * width + localX] = match.alphaMap[row * match.logoSize + col];
+            }
+        }
+        const reconstruction = await runAdaptiveReconstruction({
+            width,
+            height,
+            mask: dilatedMask,
+            alpha: alphaRegion,
+            watermarkedRgb: snapshot.rgb,
+            subtractedRgb
+        });
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = y * width + x;
+                if (!dilatedMask[index]) continue;
+                const sourceOffset = index * 3;
+                const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                png.data[targetOffset] = reconstruction.rgb[sourceOffset];
+                png.data[targetOffset + 1] = reconstruction.rgb[sourceOffset + 1];
+                png.data[targetOffset + 2] = reconstruction.rgb[sourceOffset + 2];
+            }
+        }
+        match.reconstruction = reconstruction.diagnostics;
+        delete match.watermarkedRegion;
         return true;
     }
     function smoothMask(png, x0, y0, width, height, mask, iterations) {
@@ -487,6 +572,904 @@
             }
         }
         smoothMask(png, x0, y0, width, height, mask, iterations);
+    }
+    function inpaintMaskFromNearestBoundary(png, x0, y0, width, height, mask) {
+        const pixelCount = width * height;
+        const sourceByPixel = new Int32Array(pixelCount);
+        sourceByPixel.fill(-1);
+        const queue = new Int32Array(pixelCount);
+        let queueStart = 0, queueEnd = 0;
+        const neighbors = [
+            [-1, -1], [0, -1], [1, -1],
+            [-1, 0], [1, 0],
+            [-1, 1], [0, 1], [1, 1]
+        ];
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = y * width + x;
+                if (mask[index]) continue;
+                const touchesMask = neighbors.some(([dx, dy]) => {
+                    const nx = x + dx, ny = y + dy;
+                    return nx >= 0 && ny >= 0 && nx < width && ny < height && mask[ny * width + nx];
+                });
+                if (touchesMask) {
+                    sourceByPixel[index] = index;
+                    queue[queueEnd++] = index;
+                }
+            }
+        }
+        while (queueStart < queueEnd) {
+            const index = queue[queueStart++];
+            const x = index % width, y = Math.floor(index / width);
+            for (const [dx, dy] of neighbors) {
+                const nx = x + dx, ny = y + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                const neighborIndex = ny * width + nx;
+                if (!mask[neighborIndex] || sourceByPixel[neighborIndex] !== -1) continue;
+                sourceByPixel[neighborIndex] = sourceByPixel[index];
+                queue[queueEnd++] = neighborIndex;
+            }
+        }
+        const original = new Uint8ClampedArray(png.data);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = y * width + x;
+                const sourceIndex = sourceByPixel[index];
+                if (!mask[index] || sourceIndex < 0) continue;
+                const sourceX = sourceIndex % width, sourceY = Math.floor(sourceIndex / width);
+                const sourceOffset = ((y0 + sourceY) * png.width + x0 + sourceX) << 2;
+                const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                png.data[targetOffset] = original[sourceOffset];
+                png.data[targetOffset + 1] = original[sourceOffset + 1];
+                png.data[targetOffset + 2] = original[sourceOffset + 2];
+            }
+        }
+    }
+    function inpaintMaskTelea(png, x0, y0, width, height, mask) {
+        if (typeof InpaintTelea !== 'function') {
+            inpaintMaskFromNearestBoundary(png, x0, y0, width, height, mask);
+            return;
+        }
+        for (let channel = 0; channel < 3; channel += 1) {
+            const values = new Float32Array(width * height);
+            for (let y = 0; y < height; y += 1) {
+                for (let x = 0; x < width; x += 1) {
+                    const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                    values[y * width + x] = png.data[sourceOffset + channel];
+                }
+            }
+            InpaintTelea(width, height, values, mask, 3);
+            for (let y = 0; y < height; y += 1) {
+                for (let x = 0; x < width; x += 1) {
+                    const index = y * width + x;
+                    if (!mask[index]) continue;
+                    const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                    png.data[targetOffset + channel] = clamp(Math.round(values[index]), 0, 255);
+                }
+            }
+        }
+    }
+
+    const STRUCTURE_DIRECTIONS = [
+        [0, 1], [1, 0], [1, 1], [1, -1],
+        [1, 2], [2, 1], [1, -2], [2, -1]
+    ];
+    function findDirectionalEndpoint(mask, width, height, x, y, dx, dy, sign) {
+        const limit = Math.max(width, height);
+        for (let distance = 1; distance <= limit; distance += 1) {
+            const nextX = x + (dx * distance * sign);
+            const nextY = y + (dy * distance * sign);
+            if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) return null;
+            const index = (nextY * width) + nextX;
+            if (!mask[index]) return { index, distance };
+        }
+        return null;
+    }
+    function rankStructureDirections(rgb, mask, width, height) {
+        return STRUCTURE_DIRECTIONS.map(([dx, dy]) => {
+            const differences = [];
+            let eligible = 0;
+            for (let y = 0; y < height; y += 1) {
+                for (let x = (y & 1); x < width; x += 2) {
+                    if (!mask[(y * width) + x]) continue;
+                    eligible += 1;
+                    const first = findDirectionalEndpoint(mask, width, height, x, y, dx, dy, -1);
+                    const second = findDirectionalEndpoint(mask, width, height, x, y, dx, dy, 1);
+                    if (!first || !second) continue;
+                    const firstOffset = first.index * 3;
+                    const secondOffset = second.index * 3;
+                    differences.push((
+                        Math.abs(rgb[firstOffset] - rgb[secondOffset]) +
+                        Math.abs(rgb[firstOffset + 1] - rgb[secondOffset + 1]) +
+                        Math.abs(rgb[firstOffset + 2] - rgb[secondOffset + 2])
+                    ) / 3);
+                }
+            }
+            if (differences.length === 0) return { dx, dy, score: Infinity, coverage: 0 };
+            differences.sort((a, b) => a - b);
+            const median = differences[Math.floor(differences.length * 0.5)];
+            const upperQuartile = differences[Math.floor(differences.length * 0.75)];
+            const coverage = differences.length / Math.max(1, eligible);
+            return {
+                dx,
+                dy,
+                score: median + (upperQuartile * 0.35) + ((1 - coverage) * 100),
+                coverage
+            };
+        }).sort((a, b) => a.score - b.score);
+    }
+    function smoothStructureFill(rgb, mask, width, height) {
+        const source = new Uint8ClampedArray(rgb);
+        const radius = 2;
+        const colorSigmaSquared = 18 * 18 * 2;
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = (y * width) + x;
+                if (!mask[index]) continue;
+                const offset = index * 3;
+                const sums = [0, 0, 0];
+                let totalWeight = 0;
+                for (let dy = -radius; dy <= radius; dy += 1) {
+                    for (let dx = -radius; dx <= radius; dx += 1) {
+                        const nextX = x + dx;
+                        const nextY = y + dy;
+                        if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) continue;
+                        const nextOffset = ((nextY * width) + nextX) * 3;
+                        let colorDistance = 0;
+                        for (let channel = 0; channel < 3; channel += 1) {
+                            const difference = source[nextOffset + channel] - source[offset + channel];
+                            colorDistance += difference * difference;
+                        }
+                        const spatialWeight = Math.exp(-((dx * dx) + (dy * dy)) / 4);
+                        const colorWeight = Math.exp(-colorDistance / colorSigmaSquared);
+                        const weight = spatialWeight * colorWeight;
+                        totalWeight += weight;
+                        for (let channel = 0; channel < 3; channel += 1) sums[channel] += source[nextOffset + channel] * weight;
+                    }
+                }
+                if (totalWeight <= 0) continue;
+                for (let channel = 0; channel < 3; channel += 1) rgb[offset + channel] = Math.round(sums[channel] / totalWeight);
+            }
+        }
+    }
+    function inpaintMaskStructureAware(png, x0, y0, width, height, mask) {
+        const rgb = new Uint8ClampedArray(width * height * 3);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                const targetOffset = ((y * width) + x) * 3;
+                rgb[targetOffset] = png.data[sourceOffset];
+                rgb[targetOffset + 1] = png.data[sourceOffset + 1];
+                rgb[targetOffset + 2] = png.data[sourceOffset + 2];
+            }
+        }
+        const rankedDirections = rankStructureDirections(rgb, mask, width, height);
+        const bestDirection = rankedDirections[0];
+        if (!bestDirection || !Number.isFinite(bestDirection.score) || bestDirection.score > 38) {
+            inpaintMaskTelea(png, x0, y0, width, height, mask);
+            return { method: 'telea', direction: null, score: bestDirection?.score ?? Infinity };
+        }
+        const original = new Uint8ClampedArray(rgb);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = (y * width) + x;
+                if (!mask[index]) continue;
+                let endpoints = null;
+                for (const direction of rankedDirections) {
+                    const first = findDirectionalEndpoint(mask, width, height, x, y, direction.dx, direction.dy, -1);
+                    const second = findDirectionalEndpoint(mask, width, height, x, y, direction.dx, direction.dy, 1);
+                    if (first && second) {
+                        endpoints = { first, second };
+                        break;
+                    }
+                }
+                if (!endpoints) continue;
+                const totalDistance = endpoints.first.distance + endpoints.second.distance;
+                const targetOffset = index * 3;
+                const firstOffset = endpoints.first.index * 3;
+                const secondOffset = endpoints.second.index * 3;
+                for (let channel = 0; channel < 3; channel += 1) {
+                    rgb[targetOffset + channel] = Math.round((
+                        (original[firstOffset + channel] * endpoints.second.distance) +
+                        (original[secondOffset + channel] * endpoints.first.distance)
+                    ) / totalDistance);
+                }
+            }
+        }
+        if (bestDirection.score < 12) smoothStructureFill(rgb, mask, width, height);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const index = (y * width) + x;
+                if (!mask[index]) continue;
+                const sourceOffset = index * 3;
+                const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                png.data[targetOffset] = rgb[sourceOffset];
+                png.data[targetOffset + 1] = rgb[sourceOffset + 1];
+                png.data[targetOffset + 2] = rgb[sourceOffset + 2];
+            }
+        }
+        return { method: 'directional', direction: [bestDirection.dx, bestDirection.dy], score: bestDirection.score };
+    }
+    // BEGIN SYNCED ADAPTIVE RECONSTRUCTION
+    function adaptiveReconstructRegion(input) {
+      const width = input.width;
+      const height = input.height;
+      const mask = new Uint8Array(input.mask);
+      const alpha = new Float32Array(input.alpha);
+      const watermarked = new Uint8ClampedArray(input.watermarkedRgb);
+      const subtracted = new Uint8ClampedArray(input.subtractedRgb);
+      const DIRECTIONS = [
+        [0, 1], [1, 0], [1, 1], [1, -1],
+        [1, 2], [2, 1], [1, -2], [2, -1],
+      ];
+      const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+      const rgbOffset = (x, y) => ((y * width) + x) * 3;
+
+      function endpoint(x, y, dx, dy, sign) {
+        const limit = Math.max(width, height);
+        for (let distance = 1; distance <= limit; distance += 1) {
+          const nextX = x + (dx * distance * sign);
+          const nextY = y + (dy * distance * sign);
+          if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) return null;
+          const index = (nextY * width) + nextX;
+          if (!mask[index]) return { index, distance };
+        }
+        return null;
+      }
+
+      function scoreDirection(rgb, dx, dy, bounds = null) {
+        const differences = [];
+        let eligible = 0;
+        const startX = bounds?.x0 ?? 0;
+        const startY = bounds?.y0 ?? 0;
+        const endX = bounds?.x1 ?? (width - 1);
+        const endY = bounds?.y1 ?? (height - 1);
+        for (let y = startY; y <= endY; y += 1) {
+          for (let x = startX + ((y - startY) & 1); x <= endX; x += 2) {
+            if (!mask[(y * width) + x]) continue;
+            eligible += 1;
+            const first = endpoint(x, y, dx, dy, -1);
+            const second = endpoint(x, y, dx, dy, 1);
+            if (!first || !second) continue;
+            const firstOffset = first.index * 3;
+            const secondOffset = second.index * 3;
+            differences.push((
+              Math.abs(rgb[firstOffset] - rgb[secondOffset]) +
+              Math.abs(rgb[firstOffset + 1] - rgb[secondOffset + 1]) +
+              Math.abs(rgb[firstOffset + 2] - rgb[secondOffset + 2])
+            ) / 3);
+          }
+        }
+        if (differences.length === 0) return { dx, dy, score: Infinity, coverage: 0 };
+        differences.sort((a, b) => a - b);
+        const median = differences[Math.floor(differences.length * 0.5)];
+        const upperQuartile = differences[Math.floor(differences.length * 0.75)];
+        const coverage = differences.length / Math.max(1, eligible);
+        return {
+          dx,
+          dy,
+          score: median + (upperQuartile * 0.35) + ((1 - coverage) * 100),
+          coverage,
+        };
+      }
+
+      function rankDirections(rgb, bounds = null) {
+        return DIRECTIONS.map(([dx, dy]) => scoreDirection(rgb, dx, dy, bounds))
+          .sort((first, second) => first.score - second.score);
+      }
+
+      function predictAlongDirection(rgb, x, y, direction) {
+        const first = endpoint(x, y, direction.dx, direction.dy, -1);
+        const second = endpoint(x, y, direction.dx, direction.dy, 1);
+        if (!first || !second) return null;
+        const totalDistance = first.distance + second.distance;
+        const firstOffset = first.index * 3;
+        const secondOffset = second.index * 3;
+        return [0, 1, 2].map((channel) => Math.round((
+          (rgb[firstOffset + channel] * second.distance) +
+          (rgb[secondOffset + channel] * first.distance)
+        ) / totalDistance));
+      }
+
+      function smoothLowVariationFill(rgb) {
+        const source = new Uint8ClampedArray(rgb);
+        const colorSigmaSquared = 18 * 18 * 2;
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const index = (y * width) + x;
+            if (!mask[index]) continue;
+            const offset = index * 3;
+            const sums = [0, 0, 0];
+            let totalWeight = 0;
+            for (let dy = -2; dy <= 2; dy += 1) {
+              for (let dx = -2; dx <= 2; dx += 1) {
+                const nextX = x + dx;
+                const nextY = y + dy;
+                if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) continue;
+                const nextOffset = rgbOffset(nextX, nextY);
+                let colorDistance = 0;
+                for (let channel = 0; channel < 3; channel += 1) {
+                  const difference = source[nextOffset + channel] - source[offset + channel];
+                  colorDistance += difference * difference;
+                }
+                const weight = Math.exp(-((dx * dx) + (dy * dy)) / 4)
+                  * Math.exp(-colorDistance / colorSigmaSquared);
+                totalWeight += weight;
+                for (let channel = 0; channel < 3; channel += 1) sums[channel] += source[nextOffset + channel] * weight;
+              }
+            }
+            if (totalWeight <= 0) continue;
+            for (let channel = 0; channel < 3; channel += 1) rgb[offset + channel] = Math.round(sums[channel] / totalWeight);
+          }
+        }
+      }
+
+      function globalDirectionalCandidate() {
+        const ranked = rankDirections(watermarked);
+        const output = new Uint8ClampedArray(subtracted);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            if (!mask[(y * width) + x]) continue;
+            let prediction = null;
+            for (const direction of ranked) {
+              prediction = predictAlongDirection(watermarked, x, y, direction);
+              if (prediction) break;
+            }
+            if (!prediction) continue;
+            const offset = rgbOffset(x, y);
+            output[offset] = prediction[0];
+            output[offset + 1] = prediction[1];
+            output[offset + 2] = prediction[2];
+          }
+        }
+        if (ranked[0]?.score < 12) smoothLowVariationFill(output);
+        return { name: 'directional-global', rgb: output, direction: ranked[0], ranked };
+      }
+
+      function localDirectionalCandidate(globalCandidate) {
+        const tileSize = 24;
+        const columns = Math.ceil(width / tileSize);
+        const rows = Math.ceil(height / tileSize);
+        const tileDirections = new Array(columns * rows);
+        let scoreTotal = 0;
+        let scoreCount = 0;
+        for (let tileY = 0; tileY < rows; tileY += 1) {
+          for (let tileX = 0; tileX < columns; tileX += 1) {
+            const bounds = {
+              x0: tileX * tileSize,
+              y0: tileY * tileSize,
+              x1: Math.min(width - 1, ((tileX + 1) * tileSize) - 1),
+              y1: Math.min(height - 1, ((tileY + 1) * tileSize) - 1),
+            };
+            const best = rankDirections(watermarked, bounds)[0];
+            tileDirections[(tileY * columns) + tileX] = best;
+            if (Number.isFinite(best?.score)) {
+              scoreTotal += best.score;
+              scoreCount += 1;
+            }
+          }
+        }
+        const output = new Uint8ClampedArray(globalCandidate.rgb);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            if (!mask[(y * width) + x]) continue;
+            const tileX = Math.floor(x / tileSize);
+            const tileY = Math.floor(y / tileSize);
+            const direction = tileDirections[(tileY * columns) + tileX];
+            if (!direction || !Number.isFinite(direction.score)) continue;
+            const prediction = predictAlongDirection(watermarked, x, y, direction);
+            if (!prediction) continue;
+            const offset = rgbOffset(x, y);
+            output[offset] = prediction[0];
+            output[offset + 1] = prediction[1];
+            output[offset + 2] = prediction[2];
+          }
+        }
+        return {
+          name: 'directional-local',
+          rgb: output,
+          averageDirectionScore: scoreTotal / Math.max(1, scoreCount),
+          tileDirections,
+        };
+      }
+
+      function sampleAlpha(source, x, y) {
+        if (x < 0 || y < 0 || x > width - 1 || y > height - 1) return 0;
+        const x0 = Math.floor(x);
+        const y0 = Math.floor(y);
+        const x1 = Math.min(width - 1, x0 + 1);
+        const y1 = Math.min(height - 1, y0 + 1);
+        const wx = x - x0;
+        const wy = y - y0;
+        const top = source[(y0 * width) + x0] * (1 - wx) + source[(y0 * width) + x1] * wx;
+        const bottom = source[(y1 * width) + x0] * (1 - wx) + source[(y1 * width) + x1] * wx;
+        return top * (1 - wy) + bottom * wy;
+      }
+
+      function shiftedAlpha(offsetX, offsetY) {
+        const shifted = new Float32Array(alpha.length);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) shifted[(y * width) + x] = sampleAlpha(alpha, x - offsetX, y - offsetY);
+        }
+        return shifted;
+      }
+
+      function estimateOpacityScale(shifted, guide) {
+        let numerator = 0;
+        let denominator = 0;
+        for (let index = 0; index < mask.length; index += 1) {
+          const templateAlpha = shifted[index];
+          if (!mask[index] || templateAlpha < 0.02) continue;
+          const offset = index * 3;
+          for (let channel = 0; channel < 3; channel += 1) {
+            const x = templateAlpha * (255 - guide[offset + channel]);
+            const y = watermarked[offset + channel] - guide[offset + channel];
+            if (x < 8 || y < -4) continue;
+            numerator += x * y;
+            denominator += x * x;
+          }
+        }
+        let scale = clamp(numerator / Math.max(1, denominator), 0.25, 1.25);
+        numerator = 0;
+        denominator = 0;
+        for (let index = 0; index < mask.length; index += 1) {
+          const templateAlpha = shifted[index];
+          if (!mask[index] || templateAlpha < 0.02) continue;
+          const offset = index * 3;
+          for (let channel = 0; channel < 3; channel += 1) {
+            const x = templateAlpha * (255 - guide[offset + channel]);
+            const y = watermarked[offset + channel] - guide[offset + channel];
+            if (x < 8 || y < -4 || Math.abs(y - (scale * x)) > 18) continue;
+            numerator += x * y;
+            denominator += x * x;
+          }
+        }
+        if (denominator > 0) scale = clamp(numerator / denominator, 0.25, 1.25);
+        return scale;
+      }
+
+      function calibratedAlphaCandidate(guide) {
+        const offsets = [-0.5, 0, 0.5];
+        let best = null;
+        for (const offsetY of offsets) {
+          for (const offsetX of offsets) {
+            const refinedAlpha = shiftedAlpha(offsetX, offsetY);
+            const opacityScale = estimateOpacityScale(refinedAlpha, guide);
+            const output = new Uint8ClampedArray(subtracted);
+            let guideError = 0;
+            let samples = 0;
+            let clipped = 0;
+            for (let index = 0; index < mask.length; index += 1) {
+              if (!mask[index]) continue;
+              const effectiveAlpha = clamp(refinedAlpha[index] * opacityScale, 0, 0.94);
+              const offset = index * 3;
+              if (effectiveAlpha < 0.002) continue;
+              for (let channel = 0; channel < 3; channel += 1) {
+                const raw = (watermarked[offset + channel] - (effectiveAlpha * 255)) / (1 - effectiveAlpha);
+                if (raw < 0 || raw > 255) clipped += 1;
+                const value = clamp(Math.round(raw), 0, 255);
+                output[offset + channel] = value;
+                guideError += Math.min(40, Math.abs(value - guide[offset + channel]));
+                samples += 1;
+              }
+            }
+            const calibrationScore = (guideError / Math.max(1, samples)) + ((clipped / Math.max(1, samples)) * 80);
+            if (!best || calibrationScore < best.calibrationScore) {
+              best = {
+                name: 'calibrated-alpha',
+                rgb: output,
+                alpha: refinedAlpha,
+                opacityScale,
+                offsetX,
+                offsetY,
+                calibrationScore,
+              };
+            }
+          }
+        }
+        return best;
+      }
+
+      function downsample(source, sourceMask) {
+        const smallWidth = Math.max(2, Math.ceil(width / 2));
+        const smallHeight = Math.max(2, Math.ceil(height / 2));
+        const rgb = new Uint8ClampedArray(smallWidth * smallHeight * 3);
+        const smallMask = new Uint8Array(smallWidth * smallHeight);
+        for (let y = 0; y < smallHeight; y += 1) {
+          for (let x = 0; x < smallWidth; x += 1) {
+            const sums = [0, 0, 0];
+            let count = 0;
+            let masked = 0;
+            for (let dy = 0; dy < 2; dy += 1) {
+              for (let dx = 0; dx < 2; dx += 1) {
+                const sourceX = (x * 2) + dx;
+                const sourceY = (y * 2) + dy;
+                if (sourceX >= width || sourceY >= height) continue;
+                const index = (sourceY * width) + sourceX;
+                const offset = index * 3;
+                for (let channel = 0; channel < 3; channel += 1) sums[channel] += source[offset + channel];
+                masked += sourceMask[index];
+                count += 1;
+              }
+            }
+            const targetIndex = (y * smallWidth) + x;
+            const targetOffset = targetIndex * 3;
+            for (let channel = 0; channel < 3; channel += 1) rgb[targetOffset + channel] = Math.round(sums[channel] / count);
+            smallMask[targetIndex] = masked >= Math.max(1, Math.ceil(count / 2)) ? 1 : 0;
+          }
+        }
+        return { width: smallWidth, height: smallHeight, rgb, mask: smallMask };
+      }
+
+      function fillSmallDirectional(small) {
+        const output = new Uint8ClampedArray(small.rgb);
+        const smallEndpoint = (x, y, dx, dy, sign) => {
+          for (let distance = 1; distance <= Math.max(small.width, small.height); distance += 1) {
+            const nextX = x + (dx * distance * sign);
+            const nextY = y + (dy * distance * sign);
+            if (nextX < 0 || nextY < 0 || nextX >= small.width || nextY >= small.height) return null;
+            const index = (nextY * small.width) + nextX;
+            if (!small.mask[index]) return { index, distance };
+          }
+          return null;
+        };
+        let best = null;
+        for (const [dx, dy] of DIRECTIONS) {
+          let total = 0;
+          let count = 0;
+          for (let y = 0; y < small.height; y += 2) {
+            for (let x = 0; x < small.width; x += 2) {
+              if (!small.mask[(y * small.width) + x]) continue;
+              const first = smallEndpoint(x, y, dx, dy, -1);
+              const second = smallEndpoint(x, y, dx, dy, 1);
+              if (!first || !second) continue;
+              for (let channel = 0; channel < 3; channel += 1) {
+                total += Math.abs(small.rgb[(first.index * 3) + channel] - small.rgb[(second.index * 3) + channel]);
+              }
+              count += 3;
+            }
+          }
+          const score = total / Math.max(1, count);
+          if (!best || score < best.score) best = { dx, dy, score };
+        }
+        if (!best) return output;
+        for (let y = 0; y < small.height; y += 1) {
+          for (let x = 0; x < small.width; x += 1) {
+            const index = (y * small.width) + x;
+            if (!small.mask[index]) continue;
+            const first = smallEndpoint(x, y, best.dx, best.dy, -1);
+            const second = smallEndpoint(x, y, best.dx, best.dy, 1);
+            if (!first || !second) continue;
+            const totalDistance = first.distance + second.distance;
+            for (let channel = 0; channel < 3; channel += 1) {
+              output[(index * 3) + channel] = Math.round((
+                (small.rgb[(first.index * 3) + channel] * second.distance) +
+                (small.rgb[(second.index * 3) + channel] * first.distance)
+              ) / totalDistance);
+            }
+          }
+        }
+        return output;
+      }
+
+      function multiscaleCandidate(globalCandidate) {
+        const small = downsample(watermarked, mask);
+        const filled = fillSmallDirectional(small);
+        const output = new Uint8ClampedArray(globalCandidate.rgb);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const index = (y * width) + x;
+            if (!mask[index]) continue;
+            const sourceX = x / 2;
+            const sourceY = y / 2;
+            const x0 = Math.floor(sourceX);
+            const y0 = Math.floor(sourceY);
+            const x1 = Math.min(small.width - 1, x0 + 1);
+            const y1 = Math.min(small.height - 1, y0 + 1);
+            const wx = sourceX - x0;
+            const wy = sourceY - y0;
+            const targetOffset = index * 3;
+            for (let channel = 0; channel < 3; channel += 1) {
+              const top = filled[((y0 * small.width + x0) * 3) + channel] * (1 - wx)
+                + filled[((y0 * small.width + x1) * 3) + channel] * wx;
+              const bottom = filled[((y1 * small.width + x0) * 3) + channel] * (1 - wx)
+                + filled[((y1 * small.width + x1) * 3) + channel] * wx;
+              const lowFrequency = top * (1 - wy) + bottom * wy;
+              output[targetOffset + channel] = Math.round((globalCandidate.rgb[targetOffset + channel] * 0.65) + (lowFrequency * 0.35));
+            }
+          }
+        }
+        return { name: 'multiscale', rgb: output };
+      }
+
+      function textureEnergy(rgb, includeMasked) {
+        let total = 0;
+        let count = 0;
+        for (let y = 1; y < height - 1; y += 1) {
+          for (let x = 1; x < width - 1; x += 1) {
+            const index = (y * width) + x;
+            if (Boolean(mask[index]) !== includeMasked) continue;
+            const offset = index * 3;
+            const right = offset + 3;
+            const down = offset + (width * 3);
+            for (let channel = 0; channel < 3; channel += 1) {
+              total += Math.abs(rgb[offset + channel] - rgb[right + channel]);
+              total += Math.abs(rgb[offset + channel] - rgb[down + channel]);
+              count += 2;
+            }
+          }
+        }
+        return total / Math.max(1, count);
+      }
+
+      function patchCandidate(globalCandidate, knownTexture) {
+        if (knownTexture < 4) return null;
+        const patchRadius = 2;
+        const blockRadius = 1;
+        const sources = [];
+        for (let y = patchRadius; y < height - patchRadius; y += 2) {
+          for (let x = patchRadius; x < width - patchRadius; x += 2) {
+            let valid = true;
+            for (let dy = -patchRadius; dy <= patchRadius && valid; dy += 1) {
+              for (let dx = -patchRadius; dx <= patchRadius; dx += 1) {
+                if (mask[((y + dy) * width) + x + dx]) {
+                  valid = false;
+                  break;
+                }
+              }
+            }
+            if (valid) sources.push([x, y]);
+          }
+        }
+        if (sources.length < 8) return null;
+        const output = new Uint8ClampedArray(globalCandidate.rgb);
+        for (let targetY = patchRadius; targetY < height - patchRadius; targetY += 3) {
+          for (let targetX = patchRadius; targetX < width - patchRadius; targetX += 3) {
+            if (!mask[(targetY * width) + targetX]) continue;
+            let best = null;
+            for (const [sourceX, sourceY] of sources) {
+              let error = 0;
+              for (let dy = -patchRadius; dy <= patchRadius; dy += 1) {
+                for (let dx = -patchRadius; dx <= patchRadius; dx += 1) {
+                  const targetOffset = rgbOffset(targetX + dx, targetY + dy);
+                  const sourceOffset = rgbOffset(sourceX + dx, sourceY + dy);
+                  for (let channel = 0; channel < 3; channel += 1) {
+                    const difference = globalCandidate.rgb[targetOffset + channel] - watermarked[sourceOffset + channel];
+                    error += Math.min(2500, difference * difference);
+                  }
+                }
+              }
+              error += (((targetX - sourceX) ** 2) + ((targetY - sourceY) ** 2)) * 0.08;
+              if (!best || error < best.error) best = { sourceX, sourceY, error };
+            }
+            if (!best) continue;
+            for (let dy = -blockRadius; dy <= blockRadius; dy += 1) {
+              for (let dx = -blockRadius; dx <= blockRadius; dx += 1) {
+                const x = targetX + dx;
+                const y = targetY + dy;
+                if (!mask[(y * width) + x]) continue;
+                const targetOffset = rgbOffset(x, y);
+                const sourceOffset = rgbOffset(best.sourceX + dx, best.sourceY + dy);
+                for (let channel = 0; channel < 3; channel += 1) output[targetOffset + channel] = watermarked[sourceOffset + channel];
+              }
+            }
+          }
+        }
+        return { name: 'exemplar-patch', rgb: output };
+      }
+
+      function correlationWithAlpha(rgb, guide) {
+        let sumX = 0;
+        let sumY = 0;
+        let sumXX = 0;
+        let sumYY = 0;
+        let sumXY = 0;
+        let count = 0;
+        for (let index = 0; index < mask.length; index += 1) {
+          if (!mask[index] || alpha[index] < 0.01) continue;
+          const offset = index * 3;
+          const x = alpha[index];
+          const y = ((rgb[offset] + rgb[offset + 1] + rgb[offset + 2])
+            - (guide[offset] + guide[offset + 1] + guide[offset + 2])) / 3;
+          sumX += x;
+          sumY += y;
+          sumXX += x * x;
+          sumYY += y * y;
+          sumXY += x * y;
+          count += 1;
+        }
+        const covariance = sumXY - ((sumX * sumY) / Math.max(1, count));
+        const varianceX = sumXX - ((sumX * sumX) / Math.max(1, count));
+        const varianceY = sumYY - ((sumY * sumY) / Math.max(1, count));
+        return Math.abs(covariance / Math.sqrt(Math.max(1e-6, varianceX * varianceY)));
+      }
+
+      function scoreCandidate(candidate, guide, calibration, knownTexture) {
+        let calibrationError = 0;
+        let clipping = 0;
+        let samples = 0;
+        let boundaryError = 0;
+        let boundarySamples = 0;
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const index = (y * width) + x;
+            if (!mask[index]) continue;
+            const offset = index * 3;
+            const effectiveAlpha = clamp(calibration.alpha[index] * calibration.opacityScale, 0, 0.94);
+            for (let channel = 0; channel < 3; channel += 1) {
+              const predicted = candidate.rgb[offset + channel] * (1 - effectiveAlpha) + (255 * effectiveAlpha);
+              calibrationError += Math.min(40, Math.abs(predicted - watermarked[offset + channel]));
+              if (candidate.rgb[offset + channel] < 3 && watermarked[offset + channel] > 55) clipping += 1;
+              samples += 1;
+            }
+            const neighbors = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            for (const [dx, dy] of neighbors) {
+              const nextX = x + dx;
+              const nextY = y + dy;
+              if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) continue;
+              const nextIndex = (nextY * width) + nextX;
+              if (mask[nextIndex]) continue;
+              const nextOffset = nextIndex * 3;
+              for (let channel = 0; channel < 3; channel += 1) {
+                boundaryError += Math.abs(candidate.rgb[offset + channel] - watermarked[nextOffset + channel]);
+                boundarySamples += 1;
+              }
+            }
+          }
+        }
+        const insideTexture = textureEnergy(candidate.rgb, true);
+        const texturePenalty = Math.abs(Math.log((insideTexture + 1) / (knownTexture + 1)));
+        const watermarkCorrelation = correlationWithAlpha(candidate.rgb, guide);
+        const metrics = {
+          calibrationError: calibrationError / Math.max(1, samples),
+          clippingRate: clipping / Math.max(1, samples),
+          boundaryError: boundaryError / Math.max(1, boundarySamples),
+          textureEnergy: insideTexture,
+          texturePenalty,
+          watermarkCorrelation,
+        };
+        metrics.score = (metrics.calibrationError * 0.35)
+          + (metrics.clippingRate * 90)
+          + (metrics.boundaryError * 0.035)
+          + (metrics.texturePenalty * 4)
+          + (metrics.watermarkCorrelation * 20);
+        return metrics;
+      }
+
+      function blendWithConfidence(selected, calibration, globalScore) {
+        const output = new Uint8ClampedArray(subtracted);
+        for (let index = 0; index < mask.length; index += 1) {
+          if (!mask[index]) continue;
+          const offset = index * 3;
+          const templateAlpha = calibration.alpha[index];
+          let reconstructionWeight = clamp(templateAlpha / 0.035, 0.35, 1);
+          if (globalScore < 12) reconstructionWeight = Math.max(reconstructionWeight, 0.92);
+          let alphaTrust = 0;
+          if (globalScore >= 12) {
+            let disagreement = 0;
+            for (let channel = 0; channel < 3; channel += 1) {
+              disagreement += Math.abs(calibration.rgb[offset + channel] - selected.rgb[offset + channel]);
+            }
+            disagreement /= 3;
+            alphaTrust = clamp((3 - disagreement) / 3, 0, 1) * clamp(templateAlpha / 0.12, 0, 1) * 0.65;
+          }
+          for (let channel = 0; channel < 3; channel += 1) {
+            const reconstructed = (selected.rgb[offset + channel] * (1 - alphaTrust))
+              + (calibration.rgb[offset + channel] * alphaTrust);
+            output[offset + channel] = Math.round((subtracted[offset + channel] * (1 - reconstructionWeight))
+              + (reconstructed * reconstructionWeight));
+          }
+        }
+        return output;
+      }
+
+      const globalCandidate = globalDirectionalCandidate();
+      const localCandidate = localDirectionalCandidate(globalCandidate);
+      const multiscale = multiscaleCandidate(globalCandidate);
+      const knownTexture = textureEnergy(watermarked, false);
+      const patch = patchCandidate(globalCandidate, knownTexture);
+      const calibration = calibratedAlphaCandidate(globalCandidate.rgb);
+      const candidates = [globalCandidate, localCandidate, multiscale, calibration];
+      if (patch) candidates.push(patch);
+      const scored = candidates.map((candidate) => ({
+        ...candidate,
+        metrics: scoreCandidate(candidate, globalCandidate.rgb, calibration, knownTexture),
+      })).sort((first, second) => first.metrics.score - second.metrics.score);
+
+      let selected = scored[0];
+      if (globalCandidate.direction.score < 12) {
+        selected = scored.find((candidate) => candidate.name === 'directional-global');
+      } else if (
+        localCandidate.averageDirectionScore < globalCandidate.direction.score * 0.82 &&
+        scored.find((candidate) => candidate.name === 'directional-local').metrics.score <= selected.metrics.score * 1.15
+      ) {
+        selected = scored.find((candidate) => candidate.name === 'directional-local');
+      }
+      if (selected.metrics.clippingRate > 0.08 || selected.metrics.watermarkCorrelation > 0.45) {
+        selected = scored
+          .filter((candidate) => candidate.metrics.clippingRate <= 0.08 && candidate.metrics.watermarkCorrelation <= 0.45)
+          .sort((first, second) => first.metrics.score - second.metrics.score)[0]
+          || scored.find((candidate) => candidate.name === 'directional-global');
+      }
+
+      const output = blendWithConfidence(selected, calibration, globalCandidate.direction.score);
+      return {
+        rgb: output,
+        diagnostics: {
+          method: selected.name,
+          direction: [globalCandidate.direction.dx, globalCandidate.direction.dy],
+          directionScore: globalCandidate.direction.score,
+          knownTexture,
+          opacityScale: calibration.opacityScale,
+          subpixelOffset: [calibration.offsetX, calibration.offsetY],
+          candidates: scored.map((candidate) => ({ name: candidate.name, metrics: candidate.metrics })),
+          artifactRejected: selected !== scored[0],
+        },
+      };
+    }
+    // END SYNCED ADAPTIVE RECONSTRUCTION
+    function captureMatchRegion(png, match, pad = 8) {
+        const x0 = Math.max(0, match.x - pad);
+        const y0 = Math.max(0, match.y - pad);
+        const x1 = Math.min(png.width - 1, match.x + match.logoSize - 1 + pad);
+        const y1 = Math.min(png.height - 1, match.y + match.logoSize - 1 + pad);
+        const width = x1 - x0 + 1;
+        const height = y1 - y0 + 1;
+        const rgb = new Uint8ClampedArray(width * height * 3);
+        for (let y = 0; y < height; y += 1) {
+            for (let x = 0; x < width; x += 1) {
+                const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+                const targetOffset = (y * width + x) * 3;
+                rgb[targetOffset] = png.data[sourceOffset];
+                rgb[targetOffset + 1] = png.data[sourceOffset + 1];
+                rgb[targetOffset + 2] = png.data[sourceOffset + 2];
+            }
+        }
+        return { x0, y0, width, height, rgb };
+    }
+    async function runAdaptiveReconstruction(input) {
+        let workerError = null;
+        if (typeof Worker === 'function' && typeof Blob === 'function') {
+            let worker = null;
+            let workerUrl = null;
+            try {
+                const source = `const adaptiveReconstructRegion = ${adaptiveReconstructRegion.toString()};\n` +
+                    `self.onmessage = ({ data }) => { try { const result = adaptiveReconstructRegion(data); self.postMessage(result, [result.rgb.buffer]); } catch (error) { self.postMessage({ error: error?.message || String(error) }); } };`;
+                workerUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+                let workerScriptUrl = workerUrl;
+                if (window.trustedTypes?.createPolicy) {
+                    reconstructionWorkerPolicy ||= window.trustedTypes.createPolicy('gemini-watermark-remover-worker', {
+                        createScriptURL: (value) => value
+                    });
+                    workerScriptUrl = reconstructionWorkerPolicy.createScriptURL(workerUrl);
+                }
+                worker = new Worker(workerScriptUrl);
+                const result = await new Promise((resolve, reject) => {
+                    const timeout = window.setTimeout(() => reject(new Error('Reconstruction worker timed out.')), 8000);
+                    worker.onmessage = ({ data }) => {
+                        window.clearTimeout(timeout);
+                        if (data?.error) reject(new Error(data.error));
+                        else resolve(data);
+                    };
+                    worker.onerror = (event) => {
+                        window.clearTimeout(timeout);
+                        reject(new Error(event.message || 'Reconstruction worker failed.'));
+                    };
+                    worker.postMessage(input);
+                });
+                result.diagnostics = { ...result.diagnostics, workerUsed: true };
+                return result;
+            } catch (error) {
+                workerError = error.message;
+                console.debug('[Gemini watermark remover] Worker reconstruction unavailable:', error.message);
+            } finally {
+                worker?.terminate();
+                if (workerUrl) URL.revokeObjectURL(workerUrl);
+            }
+        }
+        const result = adaptiveReconstructRegion(input);
+        result.diagnostics = { ...result.diagnostics, workerUsed: false, workerError };
+        return result;
     }
     function healResidualCorner(png, primaryMatch) {
         if (primaryMatch.logoSize !== 96 || primaryMatch.confidence < 0.8) return;
@@ -885,7 +1868,7 @@
         let fine = { x: best.x, y: best.y, score: -Infinity };
         for (let y = best.y - stride; y <= best.y + stride; y += 1) {
             for (let x = best.x - stride; x <= best.x + stride; x += 1) {
-                if (x < 0 || y < 0 || x > endX || y > endY) continue;
+                if (x < startX || y < startY || x > endX || y > endY) continue;
                 if (overlapsBounds(createBounds(x, y, logoSize), suppressed, Math.floor(logoSize / 3))) continue;
                 let pSum = 0;
                 for (let r = 0; r < logoSize; r += 1) {
@@ -935,7 +1918,11 @@
         return template;
     }
     async function planWatermarkRemoval(png, onMatch) {
-        const [template48, template96] = await Promise.all([getAlphaTemplate(48), getAlphaTemplate(96)]);
+        const [template48, template96, downscaled96Template] = await Promise.all([
+            getAlphaTemplate(48),
+            getAlphaTemplate(96),
+            getScaledAlphaTemplate(96, 48)
+        ]);
         const gray = buildGrayscale(png);
         const suppressed = [];
         const matches = [];
@@ -960,12 +1947,79 @@
             startY: default96Y,
             endY: default96Y
         });
-        if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
-            const chosen = default96Score.score >= default48Score.score
-                ? { x: default96X, y: default96Y, bbox: createBounds(default96X, default96Y, 96), logoSize: 96, alphaMap: template96.alphaMap, confidence: default96Score.score, source: 'default-placement' }
-                : { x: default48X, y: default48Y, bbox: createBounds(default48X, default48Y, 48), logoSize: 48, alphaMap: template48.alphaMap, confidence: default48Score.score, source: 'default-placement' };
+        const defaultCandidates = [
+            { ...default48Score, logoSize: 48, alphaMap: template48.alphaMap, confidence: default48Score.score, source: 'default-placement' },
+            { ...default96Score, logoSize: 96, alphaMap: template96.alphaMap, confidence: default96Score.score, source: 'default-placement' }
+        ].filter((candidate) => candidate.confidence >= DEFAULT_PLACEMENT_MIN_SCORES[candidate.logoSize]);
+        if (defaultCandidates.length > 0) {
+            const chosen = defaultCandidates.reduce((best, candidate) => candidate.confidence > best.confidence ? candidate : best);
             onMatch(chosen);
             return { found: true, matches: [chosen], confidence: chosen.confidence };
+        }
+        const previewPlacementCandidates = [template48, template96, downscaled96Template].map((template, index) => {
+            const match = findWatermarkNCC(png, template, {
+                gray,
+                ...getDownscaledPreviewSearchBounds(png, template.logoSize)
+            });
+            return {
+                ...match,
+                logoSize: template.logoSize,
+                alphaMap: template.alphaMap,
+                confidence: match.score,
+                source: index === 2 ? 'downscaled-preview-placement-search' : 'geometry-placement-search'
+            };
+        });
+        const previewPlacementMatch = previewPlacementCandidates
+            .filter((match) => match.confidence >= NEAR_CORNER_MIN_SCORES[match.logoSize])
+            .reduce((best, match) => (!best || match.confidence > best.confidence ? match : best), null);
+        const supportsGeometryFastPath = png.width === png.height && (png.width === 1024 || png.width === 2048);
+        if (supportsGeometryFastPath && previewPlacementMatch) {
+            onMatch(previewPlacementMatch);
+            return { found: true, matches: [previewPlacementMatch], confidence: previewPlacementMatch.confidence };
+        }
+        const nearCornerCandidates = [template48, template96, downscaled96Template].map((template, index) => {
+            const match = findWatermarkNCC(png, template, {
+                gray,
+                ...getNearCornerSearchBounds(png, template.logoSize)
+            });
+            return {
+                ...match,
+                logoSize: template.logoSize,
+                alphaMap: template.alphaMap,
+                confidence: match.score,
+                source: index === 2 ? 'downscaled-preview-search' : 'near-corner-search'
+            };
+        });
+        const nearCornerMatch = nearCornerCandidates
+            .filter((match) => match.confidence >= NEAR_CORNER_MIN_SCORES[match.logoSize])
+            .reduce((best, match) => (!best || match.confidence > best.confidence ? match : best), null);
+        if (nearCornerMatch) {
+            let localScaledMatch = null;
+            for (const logoSize of SCALED_MATCH_SIZES) {
+                const template = await getScaledAlphaTemplate(48, logoSize);
+                const match = findWatermarkNCC(png, template, {
+                    gray,
+                    ...getLocalScaleSearchBounds(png, logoSize, nearCornerMatch)
+                });
+                if (!localScaledMatch || match.score > localScaledMatch.confidence) {
+                    localScaledMatch = {
+                        ...match,
+                        logoSize,
+                        alphaMap: template.alphaMap,
+                        confidence: match.score,
+                        source: 'scaled-search'
+                    };
+                }
+            }
+            if (
+                localScaledMatch?.confidence >= SCALED_MATCH_MIN_SCORE &&
+                localScaledMatch.confidence >= nearCornerMatch.confidence + SCALED_MATCH_ADVANTAGE
+            ) {
+                onMatch(localScaledMatch);
+                return { found: true, matches: [localScaledMatch], confidence: localScaledMatch.confidence };
+            }
+            onMatch(nearCornerMatch);
+            return { found: true, matches: [nearCornerMatch], confidence: nearCornerMatch.confidence };
         }
         for (let index = 0; index < 4; index += 1) {
             const match48 = findWatermarkNCC(png, template48, {
@@ -1009,6 +2063,33 @@
             onMatch(chosen);
         }
         if (matches.length) return { found: true, matches, confidence: matches[0].confidence };
+        let bestScaledMatch = null;
+        for (const logoSize of SCALED_MATCH_SIZES) {
+            const template = await getScaledAlphaTemplate(48, logoSize);
+            const match = findWatermarkNCC(png, template, {
+                gray,
+                ...getCornerSearchBounds(png, logoSize)
+            });
+            if (
+                Number.isFinite(match.score) &&
+                isNearCornerPlacement(png, match, logoSize) &&
+                (!bestScaledMatch || match.score > bestScaledMatch.confidence)
+            ) {
+                bestScaledMatch = {
+                    ...match,
+                    logoSize,
+                    alphaMap: template.alphaMap,
+                    confidence: match.score,
+                    source: 'scaled-search'
+                };
+            }
+        }
+        const scaledIsClearlyBetter =
+            bestScaledMatch?.confidence >= SCALED_MATCH_MIN_SCORE;
+        if (scaledIsClearlyBetter) {
+            onMatch(bestScaledMatch);
+            return { found: true, matches: [bestScaledMatch], confidence: bestScaledMatch.confidence };
+        }
         const confidence = Math.max(lastMatch48.score, lastMatch96.score);
         try {
             const detectorResult = findWatermarkSparkles(png);
@@ -1025,20 +2106,13 @@
                 endX: Math.min(png.width - scaledTemplate.logoSize, detectorPrimary.bbox.x1 + 20),
                 endY: Math.min(png.height - scaledTemplate.logoSize, detectorPrimary.bbox.y1 + 20)
             });
-            const refinedUsable = Number.isFinite(refined.score) && refined.score >= 0.35;
-            const fallbackCandidate = refinedUsable
-                ? refined
-                : {
-                    x: detectorPrimary.bbox.x0,
-                    y: detectorPrimary.bbox.y0,
-                    bbox: createBounds(detectorPrimary.bbox.x0, detectorPrimary.bbox.y0, scaledTemplate.logoSize),
-                    score: detectorResult.confidence
-                };
             const detectorReliable =
                 detectorResult.confidence >= 0.72 &&
                 detectorPrimary.geometry >= 0.5 &&
                 detectorPrimary.requiredArmCoverage >= 0.7;
-            if (isNearCornerPlacement(png, fallbackCandidate, scaledTemplate.logoSize) && (refinedUsable || detectorReliable)) {
+            const refinedUsable = Number.isFinite(refined.score) && refined.score >= DETECTOR_GUIDED_MIN_SCORE;
+            const fallbackCandidate = refined;
+            if (detectorReliable && refinedUsable && isNearCornerPlacement(png, fallbackCandidate, scaledTemplate.logoSize)) {
                 const chosen = {
                     ...fallbackCandidate,
                     logoSize: scaledTemplate.logoSize,
@@ -1051,7 +2125,16 @@
         } catch (error) {
             // Keep the userscript deterministic even if the geometric fallback cannot isolate a corner sparkle.
         }
-        return { found: false, matches: [], confidence: Number.isFinite(confidence) ? confidence : 0 };
+        return {
+            found: false,
+            matches: [],
+            confidence: Number.isFinite(confidence) ? confidence : 0,
+            nearCornerCandidates,
+            cornerCandidates: [
+                { ...lastMatch48, logoSize: 48, confidence: lastMatch48.score, source: 'corner-search' },
+                { ...lastMatch96, logoSize: 96, confidence: lastMatch96.score, source: 'corner-search' }
+            ]
+        };
     }
     function applySubtraction(png, match) {
         const { ALPHA_THRESHOLD, MAX_ALPHA, LOGO_VALUE } = CONSTANTS;
@@ -1071,16 +2154,18 @@
             }
         }
     }
-    async function runDetectorResidualCleanup(png) {
+    async function runDetectorResidualCleanup(png, primaryMatch) {
         try {
             const detectorResult = findWatermarkSparkles(png);
             const sparkle = detectorResult.sparkles[0];
+            const primaryBounds = createBounds(primaryMatch.x, primaryMatch.y, primaryMatch.logoSize);
             const residualSize = Math.max(24, Math.min(48, sparkle.size));
             const residualCandidate = {
                 x: sparkle.bbox.x0,
                 y: sparkle.bbox.y0
             };
             if (
+                overlapsBounds(sparkle.bbox, [primaryBounds]) &&
                 isNearCornerPlacement(png, residualCandidate, residualSize) &&
                 detectorResult.confidence >= 0.62 &&
                 sparkle.geometry >= 0.55
@@ -1135,10 +2220,11 @@
             const png = rasterFromImage(imgSource);
             const plan = await planWatermarkRemoval(png, onMatch);
             if (!plan.found) return { changed: false, canvas: null, plan };
+            for (const match of plan.matches) match.watermarkedRegion = captureMatchRegion(png, match);
             for (const match of plan.matches) applySubtraction(png, match);
-            healScaledTemplateMatch(png, plan.matches[0]);
-            if (plan.matches[0]?.source !== 'default-placement') {
-                await runDetectorResidualCleanup(png);
+            await healScaledTemplateMatch(png, plan.matches[0]);
+            if (!['default-placement', 'geometry-placement-search', 'downscaled-preview-placement-search'].includes(plan.matches[0]?.source)) {
+                await runDetectorResidualCleanup(png, plan.matches[0]);
             }
             healResidualCorner(png, plan.matches[0]);
             return { changed: true, canvas: canvasFromRaster(png), plan };
@@ -1148,17 +2234,47 @@
         constructor() {
             this.engine = null;
             this.originalFetch = window.fetch.bind(window);
+            this.originalCreateObjectURL = URL.createObjectURL.bind(URL);
+            this.originalRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+            this.originalAnchorClick = HTMLAnchorElement.prototype.click;
+            this.originalClipboardItem = window.ClipboardItem;
             this.objectUrls = new Set();
+            this.capturedBlobsByUrl = new Map();
             this.cleaningByUrl = new Map();
+            this.pageScanPromise = null;
+            this.fullSizeWaitTimer = null;
+            this.clipboardCopyWaitTimer = null;
+            this.transferDiagnostics = { calls: 0, blobSeen: false, lastSize: 0, pendingAtCall: false };
+            this.autoCleanDownloads = true;
+            this.ui = null;
+            this.activity = {
+                attempts: 0,
+                cleaned: 0,
+                unchanged: 0,
+                failures: 0,
+                lastMatch: null,
+                lastAnalysis: null,
+                lastDurationMs: null
+            };
             void this.init();
         }
         async init() {
             try {
+                this.setupDownloadArtifactInterceptor();
+                this.setupDownloadTransferInterceptor();
+                this.setupClipboardInterceptor();
                 this.setupNetworkInterceptor();
+                this.setupClickInterceptor();
                 this.installPublicApi();
                 this.setupObjectUrlCleanup();
-                this.log('Ready. Download cleanup is lazy; page images are not scanned.');
+                if (document.readyState === 'loading') {
+                    await new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+                }
+                this.installPanel();
+                this.setStatus('ready', 'Ready', 'Downloads and image copies will be checked automatically.');
+                this.log('Ready. Download and clipboard cleanup is lazy; page images are not scanned.');
             } catch (error) {
+                this.setStatus('error', 'Initialization failed', error.message);
                 console.error('[Gemini watermark remover] Init failed:', error);
             }
         }
@@ -1168,6 +2284,177 @@
                 'color:#2563eb;',
                 ...args);
         }
+        installPanel() {
+            const host = document.createElement('div');
+            host.id = 'gemini-watermark-remover-panel';
+            const shadow = host.attachShadow({ mode: 'open' });
+            const createElement = (tagName, options = {}) => {
+                const element = document.createElement(tagName);
+                if (options.id) element.id = options.id;
+                if (options.className) element.className = options.className;
+                if (options.text !== undefined) element.textContent = options.text;
+                for (const [name, value] of Object.entries(options.attributes || {})) {
+                    element.setAttribute(name, value);
+                }
+                return element;
+            };
+            const style = createElement('style');
+            style.textContent = `
+                :host { position:fixed; right:12px; top:12px; z-index:2147483647; font-family:Arial,sans-serif; letter-spacing:0; color:#171717; }
+                * { box-sizing:border-box; letter-spacing:0; }
+                .panel { width:280px; max-width:calc(100vw - 24px); background:#fff; border:1px solid #d4d4d4; border-radius:7px; box-shadow:0 8px 22px rgba(0,0,0,.2); overflow:hidden; }
+                .panel.collapsed { width:36px; height:36px; }
+                header { min-height:40px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 6px 6px 12px; background:#171717; color:#fff; }
+                .panel.collapsed header { height:34px; min-height:34px; gap:0; padding:2px; }
+                .panel.collapsed .title { display:none; }
+                .title { min-width:0; display:flex; flex-direction:column; gap:2px; }
+                strong { font-size:14px; line-height:18px; font-weight:700; }
+                #summary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#d4d4d4; font-size:11px; line-height:14px; }
+                .icon { width:30px; height:30px; flex:0 0 30px; border:0; border-radius:4px; background:transparent; color:inherit; font-size:20px; line-height:30px; padding:0; cursor:pointer; }
+                .icon:hover { background:#404040; }
+                .panel.collapsed .icon { position:relative; color:#f5f5f5; font-size:20px; }
+                .panel.collapsed .icon::after { content:""; position:absolute; left:6px; top:14px; width:18px; height:2px; border-radius:1px; background:#34d399; transform:rotate(-42deg); pointer-events:none; }
+                .body { padding:10px; display:grid; gap:8px; }
+                .panel.collapsed .body { display:none; }
+                .state { min-height:44px; display:grid; grid-template-columns:10px minmax(0,1fr); column-gap:8px; align-items:start; }
+                .dot { width:8px; height:8px; margin-top:5px; border-radius:50%; background:#737373; }
+                :host([data-state="working"]) .dot { background:#2563eb; }
+                :host([data-state="success"]) .dot { background:#15803d; }
+                :host([data-state="warning"]) .dot { background:#b45309; }
+                :host([data-state="error"]) .dot { background:#b91c1c; }
+                .message { min-width:0; }
+                #message { font-size:13px; line-height:18px; font-weight:600; overflow-wrap:anywhere; }
+                #detail { display:block; margin-top:2px; color:#525252; font-size:11px; line-height:15px; overflow-wrap:anywhere; }
+                .actions { display:grid; grid-template-columns:1fr 1fr 34px; gap:6px; }
+                button, .file-button { min-height:34px; border:1px solid #a3a3a3; border-radius:5px; background:#fafafa; color:#171717; font:600 12px/16px Arial,sans-serif; padding:8px 10px; cursor:pointer; text-align:center; }
+                button:hover, .file-button:hover { background:#e5e5e5; }
+                button:disabled { cursor:wait; opacity:.55; }
+                .file-button { display:flex; align-items:center; justify-content:center; }
+                .file-button input { display:none; }
+                #rescan { width:34px; padding:0; font-size:18px; }
+                .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:12px; font-size:12px; line-height:18px; }
+                .toggle { position:relative; width:34px; height:20px; flex:0 0 34px; }
+                .toggle input { position:absolute; opacity:0; width:1px; height:1px; }
+                .track { position:absolute; inset:0; border-radius:10px; background:#a3a3a3; cursor:pointer; }
+                .track::after { content:""; position:absolute; top:3px; left:3px; width:14px; height:14px; border-radius:50%; background:#fff; transition:transform .15s ease; }
+                .toggle input:checked + .track { background:#15803d; }
+                .toggle input:checked + .track::after { transform:translateX(14px); }
+                footer { border-top:1px solid #e5e5e5; padding-top:8px; color:#737373; font-size:11px; line-height:14px; }
+                @media (max-width:420px) { :host { right:8px; top:8px; } .panel { max-width:calc(100vw - 16px); } }
+            `;
+            const panel = createElement('section', {
+                className: 'panel collapsed',
+                attributes: { 'aria-label': 'Gemini watermark cleaner' }
+            });
+            const header = createElement('header');
+            const title = createElement('div', { className: 'title' });
+            title.append(
+                createElement('strong', { text: 'Watermark cleaner' }),
+                createElement('span', { id: 'summary', text: 'Ready' })
+            );
+            const collapse = createElement('button', {
+                id: 'collapse',
+                className: 'icon',
+                text: '\u2726',
+                attributes: { type: 'button', title: 'Open watermark cleaner', 'aria-label': 'Open watermark cleaner' }
+            });
+            header.append(title, collapse);
+
+            const body = createElement('div', { className: 'body' });
+            const state = createElement('div', { className: 'state' });
+            const messageBox = createElement('div', { className: 'message' });
+            messageBox.append(
+                createElement('div', { id: 'message', text: 'Ready' }),
+                createElement('small', { id: 'detail' })
+            );
+            state.append(createElement('span', { className: 'dot' }), messageBox);
+
+            const actions = createElement('div', { className: 'actions' });
+            const cleanLatest = createElement('button', {
+                id: 'clean-latest',
+                text: 'Clean latest',
+                attributes: { type: 'button' }
+            });
+            const fileButton = createElement('label', { className: 'file-button', text: 'Clean file' });
+            const file = createElement('input', {
+                id: 'file',
+                attributes: { type: 'file', accept: 'image/png,image/jpeg,image/webp' }
+            });
+            fileButton.append(file);
+            const rescan = createElement('button', {
+                id: 'rescan',
+                text: '\u21bb',
+                attributes: {
+                    type: 'button',
+                    title: 'Clean images shown on the page',
+                    'aria-label': 'Rescan page'
+                }
+            });
+            actions.append(cleanLatest, fileButton, rescan);
+
+            const toggleRow = createElement('div', { className: 'toggle-row' });
+            const toggle = createElement('label', { className: 'toggle' });
+            const auto = createElement('input', { id: 'auto', attributes: { type: 'checkbox' } });
+            auto.checked = true;
+            toggle.append(auto, createElement('span', { className: 'track' }));
+            toggleRow.append(createElement('span', { text: 'Auto-clean saves & copies' }), toggle);
+            body.append(
+                state,
+                actions,
+                toggleRow,
+                createElement('footer', { id: 'counts', text: '0 cleaned, 0 unchanged' })
+            );
+            panel.append(header, body);
+            shadow.append(style, panel);
+            document.documentElement.appendChild(host);
+            collapse.addEventListener('click', () => {
+                const collapsed = panel.classList.toggle('collapsed');
+                collapse.textContent = collapsed ? '\u2726' : '\u2212';
+                collapse.title = collapsed ? 'Open watermark cleaner' : 'Minimize watermark cleaner';
+                collapse.setAttribute('aria-label', collapse.title);
+            });
+            shadow.getElementById('clean-latest').addEventListener('click', () => void this.cleanLatestImage());
+            shadow.getElementById('rescan').addEventListener('click', () => this.processExistingImages());
+            shadow.getElementById('auto').addEventListener('change', (event) => this.setAutoClean(event.target.checked));
+            shadow.getElementById('file').addEventListener('change', (event) => {
+                const [file] = event.target.files;
+                if (file) void this.cleanLocalFile(file);
+                event.target.value = '';
+            });
+            this.ui = {
+                host,
+                summary: shadow.getElementById('summary'),
+                message: shadow.getElementById('message'),
+                detail: shadow.getElementById('detail'),
+                counts: shadow.getElementById('counts'),
+                cleanLatest: shadow.getElementById('clean-latest'),
+                file: shadow.getElementById('file'),
+                rescan: shadow.getElementById('rescan'),
+                auto: shadow.getElementById('auto')
+            };
+        }
+        setStatus(state, message, detail = '') {
+            if (!this.ui) return;
+            this.ui.host.dataset.state = state;
+            this.ui.summary.textContent = message;
+            this.ui.message.textContent = message;
+            this.ui.detail.textContent = detail;
+            const working = state === 'working';
+            this.ui.cleanLatest.disabled = working;
+            this.ui.file.disabled = working;
+            this.ui.rescan.disabled = working;
+            this.updatePanelStats();
+        }
+        updatePanelStats() {
+            if (!this.ui) return;
+            this.ui.counts.textContent = `${this.activity.cleaned} cleaned, ${this.activity.unchanged} unchanged, ${this.activity.failures} failed`;
+        }
+        setAutoClean(enabled) {
+            this.autoCleanDownloads = Boolean(enabled);
+            if (this.ui) this.ui.auto.checked = this.autoCleanDownloads;
+            this.setStatus('ready', this.autoCleanDownloads ? 'Auto-clean enabled' : 'Auto-clean paused');
+            return this.autoCleanDownloads;
+        }
         cleanUrl(url) {
             return url.replace(/=s\d+(?=[-?#]|$)/, '=s0');
         }
@@ -1175,6 +2462,18 @@
             if (typeof input === 'string' || input instanceof URL) return highResUrl;
             if (input instanceof Request) return new Request(highResUrl, input);
             return input;
+        }
+        async fetchImage(url, options = {}) {
+            const controller = new AbortController();
+            const timeout = window.setTimeout(() => controller.abort(), 30000);
+            try {
+                return await this.originalFetch(url, { credentials: 'include', ...options, signal: controller.signal });
+            } catch (error) {
+                if (error?.name === 'AbortError') throw new Error('Image request timed out after 30 seconds.');
+                throw error;
+            } finally {
+                window.clearTimeout(timeout);
+            }
         }
         async getEngine() {
             if (!this.engine) this.engine = await WatermarkEngine.create();
@@ -1184,27 +2483,59 @@
             window.geminiWatermarkRemover = Object.freeze({
                 rescan: () => this.processExistingImages(),
                 cleanBlob: (blob) => this.cleanImageBlob(blob, 'manual'),
+                cleanLatest: () => this.cleanLatestImage(),
+                setAutoClean: (enabled) => this.setAutoClean(enabled),
                 stats: () => ({
                     engineReady: Boolean(this.engine),
                     activeObjectUrls: this.objectUrls.size,
                     activeCleanups: this.cleaningByUrl.size,
+                    activePageScan: Boolean(this.pageScanPromise),
+                    waitingForFullSize: Boolean(this.fullSizeWaitTimer),
+                    waitingForClipboard: Boolean(this.clipboardCopyWaitTimer),
+                    clipboardHooks: {
+                        item: Boolean(window.ClipboardItem?.__gwrWrapped),
+                        write: Boolean(window.Clipboard?.prototype.write?.__gwrWrapped)
+                    },
+                    transferHooks: {
+                        worker: Boolean(window.Worker?.prototype.postMessage?.__gwrWrapped),
+                        messagePort: Boolean(window.MessagePort?.prototype.postMessage?.__gwrWrapped),
+                        broadcastChannel: Boolean(window.BroadcastChannel?.prototype.postMessage?.__gwrWrapped)
+                    },
+                    transferDiagnostics: { ...this.transferDiagnostics },
                     templatesCached: TEMPLATE_CACHE.size,
-                    scaledTemplatesCached: SCALED_TEMPLATE_CACHE.size
+                    scaledTemplatesCached: SCALED_TEMPLATE_CACHE.size,
+                    autoCleanDownloads: this.autoCleanDownloads,
+                    ...this.activity
                 })
             });
         }
-        async cleanImageBlob(blob, label) {
+        async canvasToPngBlob(canvas) {
+            return new Promise((resolve, reject) => {
+                canvas.toBlob((value) => value ? resolve(value) : reject(new Error('Canvas encoding failed.')), 'image/png');
+            });
+        }
+        async imageSourceToPngBlob(source) {
+            const raster = rasterFromImage(source);
+            return this.canvasToPngBlob(canvasFromRaster(raster));
+        }
+        async cleanImageSource(source, label, originalBlob = null) {
             const engine = await this.getEngine();
+            const result = await engine.processImage(source, (match) => {
+                this.log(`${label}: locked ${match.logoSize}px at x:${match.x}, y:${match.y} (${(match.confidence * 100).toFixed(1)}%)`);
+            });
+            if (!result.changed || !result.canvas) {
+                return {
+                    blob: originalBlob || await this.imageSourceToPngBlob(source),
+                    changed: false,
+                    plan: result.plan
+                };
+            }
+            return { blob: await this.canvasToPngBlob(result.canvas), changed: true, plan: result.plan };
+        }
+        async cleanImageBlob(blob, label) {
             const bitmap = await createImageBitmap(blob);
             try {
-                const result = await engine.processImage(bitmap, (match) => {
-                    this.log(`${label}: locked ${match.logoSize}px at x:${match.x}, y:${match.y} (${(match.confidence * 100).toFixed(1)}%)`);
-                });
-                if (!result.changed || !result.canvas) return { blob, changed: false, plan: result.plan };
-                const cleanedBlob = await new Promise((resolve, reject) => {
-                    result.canvas.toBlob((value) => value ? resolve(value) : reject(new Error('Canvas encoding failed.')), 'image/png');
-                });
-                return { blob: cleanedBlob, changed: true, plan: result.plan };
+                return await this.cleanImageSource(bitmap, label, blob);
             } finally {
                 if (typeof bitmap.close === 'function') bitmap.close();
             }
@@ -1216,8 +2547,515 @@
             this.cleaningByUrl.set(cleanUrl, cleanup);
             return cleanup;
         }
+        async cleanImageSourceForUrl(cleanUrl, source, label) {
+            if (this.cleaningByUrl.has(cleanUrl)) return this.cleaningByUrl.get(cleanUrl);
+            const cleanup = this.cleanImageSource(source, label)
+                .finally(() => this.cleaningByUrl.delete(cleanUrl));
+            this.cleaningByUrl.set(cleanUrl, cleanup);
+            return cleanup;
+        }
+        getImageUrlNearControl(control, eventPath = []) {
+            const containerSelector = 'generated-image, .generated-image-container, [data-test-id*="generated-image"]';
+            const pathContainer = eventPath.find((element) => element.matches?.(containerSelector));
+            const container = pathContainer || control?.closest(containerSelector);
+            const image = this.selectBestGeneratedImage(container?.querySelectorAll('img') || []);
+            if (image) return this.getImageCandidateUrl(image);
+            return this.getLatestImageUrl();
+        }
+        isProcessableImageUrl(url) {
+            return Boolean(url) && (
+                CONSTANTS.URL_PATTERN.test(url) ||
+                url.startsWith('blob:https://gemini.google.com/')
+            );
+        }
+        getImageCandidateUrl(image) {
+            const srcsetUrls = (image?.getAttribute('srcset') || '')
+                .split(',')
+                .map((entry) => entry.trim().split(/\s+/)[0])
+                .filter(Boolean);
+            const candidates = [
+                image?.currentSrc,
+                image?.src,
+                image?.getAttribute('src'),
+                ...srcsetUrls
+            ].filter(Boolean);
+            return candidates.find((url) => CONSTANTS.URL_PATTERN.test(url)) ||
+                candidates.find((url) => this.isProcessableImageUrl(url)) ||
+                null;
+        }
+        isVisibleImage(image) {
+            if (!image?.isConnected) return false;
+            const rect = image.getBoundingClientRect();
+            const style = window.getComputedStyle(image);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        }
+        selectBestGeneratedImage(images) {
+            let best = null;
+            let bestScore = -Infinity;
+            Array.from(images).forEach((image, index) => {
+                const url = this.getImageCandidateUrl(image);
+                if (!url) return;
+                const rect = image.getBoundingClientRect();
+                const renderedArea = Math.max(0, rect.width * rect.height);
+                const sourceArea = Math.max(0, image.naturalWidth * image.naturalHeight);
+                const longestEdge = Math.max(rect.width, rect.height, image.naturalWidth, image.naturalHeight);
+                if (longestEdge < 160) return;
+                const visibleBonus = this.isVisibleImage(image) ? 1e12 : 0;
+                const score = visibleBonus + Math.max(renderedArea, sourceArea) + index;
+                if (score > bestScore) {
+                    best = image;
+                    bestScore = score;
+                }
+            });
+            return best;
+        }
+        getLatestImageUrl() {
+            const image = this.selectBestGeneratedImage(document.querySelectorAll('img'));
+            return image ? this.getImageCandidateUrl(image) : null;
+        }
+        findImageForUrl(url) {
+            return this.selectBestGeneratedImage(
+                Array.from(document.querySelectorAll('img')).filter((image) => this.getImageCandidateUrl(image) === url)
+            );
+        }
+        isDownscaledBlobPreview(url) {
+            if (!url?.startsWith('blob:')) return false;
+            const image = this.findImageForUrl(url);
+            return Boolean(image) && Math.max(image.naturalWidth, image.naturalHeight) <= 1024;
+        }
+        downloadBlob(blob, filename) {
+            const objectUrl = URL.createObjectURL(blob);
+            this.objectUrls.add(objectUrl);
+            const anchor = document.createElement('a');
+            anchor.href = objectUrl;
+            anchor.download = filename || 'Gemini_Generated_Image_cleaned.png';
+            anchor.dataset.gwrBypass = 'true';
+            anchor.style.display = 'none';
+            document.documentElement.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            window.setTimeout(() => {
+                URL.revokeObjectURL(objectUrl);
+                this.objectUrls.delete(objectUrl);
+            }, 60000);
+        }
+        clearFullSizeWait() {
+            if (!this.fullSizeWaitTimer) return;
+            window.clearTimeout(this.fullSizeWaitTimer);
+            this.fullSizeWaitTimer = null;
+        }
+        beginFullSizeWait() {
+            this.clearFullSizeWait();
+            this.setStatus('working', 'Preparing full-size download', 'Waiting for Gemini\'s full-resolution image...');
+            this.fullSizeWaitTimer = window.setTimeout(() => {
+                this.fullSizeWaitTimer = null;
+                this.activity.failures += 1;
+                this.updatePanelStats();
+                this.setStatus('error', 'Download was not cleaned', 'Use Clean file on the downloaded image.');
+            }, FULL_SIZE_WAIT_TIMEOUT_MS);
+        }
+        clearClipboardCopyWait() {
+            if (!this.clipboardCopyWaitTimer) return;
+            window.clearTimeout(this.clipboardCopyWaitTimer);
+            this.clipboardCopyWaitTimer = null;
+        }
+        beginClipboardCopyWait() {
+            this.clearClipboardCopyWait();
+            this.setStatus('working', 'Preparing clean copy', 'Waiting for Gemini\'s clipboard image...');
+            this.clipboardCopyWaitTimer = window.setTimeout(() => {
+                this.clipboardCopyWaitTimer = null;
+                this.activity.failures += 1;
+                this.updatePanelStats();
+                this.setStatus('error', 'Copy was not cleaned', 'Gemini did not expose an image clipboard payload.');
+            }, CLIPBOARD_WAIT_TIMEOUT_MS);
+        }
+        async cleanClipboardBlob(blob) {
+            this.clearClipboardCopyWait();
+            this.activity.attempts += 1;
+            this.setStatus('working', 'Cleaning clipboard image', 'Matching and reconstructing the watermark region...');
+            const startedAt = performance.now();
+            try {
+                const result = await this.cleanImageBlob(blob, 'clipboard copy');
+                this.activity.lastDurationMs = Math.round(performance.now() - startedAt);
+                this.recordResult(result);
+                if (result.changed) {
+                    const match = result.plan.matches[0];
+                    this.setStatus('success', 'Copied cleaned image', `${match.logoSize}px match at ${match.x}, ${match.y} (${(match.confidence * 100).toFixed(1)}%).`);
+                } else {
+                    this.setStatus('warning', 'Copied image unchanged', 'No confident watermark match was found.');
+                }
+                return result.blob;
+            } catch (error) {
+                this.activity.lastDurationMs = Math.round(performance.now() - startedAt);
+                this.activity.failures += 1;
+                this.updatePanelStats();
+                this.setStatus('error', 'Copy was not cleaned', 'Gemini copied the original image.');
+                console.warn('[Gemini watermark remover] Clipboard processing failed:', error);
+                return blob;
+            }
+        }
+        prepareClipboardItemData(data) {
+            if (!this.clipboardCopyWaitTimer || !this.autoCleanDownloads || !data || typeof data !== 'object') return null;
+            const entries = Object.entries(data);
+            const imageEntry = entries.find(([type]) => type.toLowerCase() === 'image/png') ||
+                entries.find(([type]) => type.toLowerCase().startsWith('image/'));
+            if (!imageEntry) return null;
+            this.clearClipboardCopyWait();
+            const [imageType, imageValue] = imageEntry;
+            return Object.fromEntries(entries.map(([type, value]) => [
+                type,
+                type === imageType
+                    ? Promise.resolve(imageValue).then((resolved) => {
+                        const blob = resolved instanceof Blob ? resolved : new Blob([resolved], { type: imageType });
+                        return this.cleanClipboardBlob(blob);
+                    })
+                    : value
+            ]));
+        }
+        prepareExistingClipboardItems(items) {
+            if (!this.clipboardCopyWaitTimer || !this.autoCleanDownloads || !this.originalClipboardItem || !Array.isArray(items)) return null;
+            const itemIndex = items.findIndex((item) => Array.from(item?.types || []).some((type) => type.toLowerCase().startsWith('image/')));
+            if (itemIndex < 0) return null;
+            const item = items[itemIndex];
+            const types = Array.from(item.types);
+            const imageType = types.find((type) => type.toLowerCase() === 'image/png') ||
+                types.find((type) => type.toLowerCase().startsWith('image/'));
+            this.clearClipboardCopyWait();
+            const data = Object.fromEntries(types.map((type) => [
+                type,
+                type === imageType
+                    ? item.getType(type).then((blob) => this.cleanClipboardBlob(blob))
+                    : item.getType(type)
+            ]));
+            const replacement = new this.originalClipboardItem(data, { presentationStyle: item.presentationStyle });
+            return items.map((entry, index) => index === itemIndex ? replacement : entry);
+        }
+        setupClipboardInterceptor() {
+            const remover = this;
+            const OriginalClipboardItem = this.originalClipboardItem;
+            if (OriginalClipboardItem && !OriginalClipboardItem.__gwrWrapped) {
+                const WrappedClipboardItem = function (data, options) {
+                    const replacement = remover.prepareClipboardItemData(data);
+                    return new OriginalClipboardItem(replacement || data, options);
+                };
+                Object.setPrototypeOf(WrappedClipboardItem, OriginalClipboardItem);
+                WrappedClipboardItem.prototype = OriginalClipboardItem.prototype;
+                Object.defineProperty(WrappedClipboardItem, '__gwrWrapped', { value: true });
+                try {
+                    Object.defineProperty(window, 'ClipboardItem', {
+                        configurable: true,
+                        writable: true,
+                        value: WrappedClipboardItem
+                    });
+                } catch (error) {
+                    console.debug('[Gemini watermark remover] ClipboardItem constructor hook unavailable:', error);
+                }
+            }
+            const clipboardPrototype = window.Clipboard?.prototype;
+            if (!clipboardPrototype?.write || clipboardPrototype.write.__gwrWrapped) return;
+            const originalWrite = clipboardPrototype.write;
+            const wrappedWrite = function (items) {
+                const replacements = remover.prepareExistingClipboardItems(items);
+                return originalWrite.call(this, replacements || items);
+            };
+            Object.defineProperty(wrappedWrite, '__gwrWrapped', { value: true });
+            try {
+                clipboardPrototype.write = wrappedWrite;
+            } catch (error) {
+                console.debug('[Gemini watermark remover] Clipboard write hook unavailable:', error);
+            }
+        }
+        cleanedFilename(filename) {
+            const value = filename || 'Gemini_Generated_Image.png';
+            const extensionIndex = value.lastIndexOf('.');
+            const base = extensionIndex > 0 ? value.slice(0, extensionIndex) : value;
+            const extension = extensionIndex > 0 ? value.slice(extensionIndex) : '.png';
+            return `${base.replace(/-cleaned$/i, '')}-cleaned${extension}`;
+        }
+        async cleanCapturedDownloadBlob(blob, filename) {
+            this.clearFullSizeWait();
+            this.activity.attempts += 1;
+            this.setStatus('working', 'Cleaning full-size download', 'Matching and reconstructing the watermark region...');
+            try {
+                const result = await this.cleanImageBlob(blob, 'native download');
+                this.recordResult(result);
+                this.downloadBlob(result.blob, this.cleanedFilename(filename));
+                if (result.changed) {
+                    const match = result.plan.matches[0];
+                    this.setStatus('success', 'Cleaned download saved', `${match.logoSize}px match at ${match.x}, ${match.y} (${(match.confidence * 100).toFixed(1)}%).`);
+                } else {
+                    this.setStatus('warning', 'No watermark match', 'The full-size image was saved unchanged.');
+                }
+                return result;
+            } catch (error) {
+                this.activity.failures += 1;
+                this.updatePanelStats();
+                this.setStatus('error', 'Download cleaning failed', error.message);
+                console.warn('[Gemini watermark remover] Captured download processing failed:', error);
+                throw error;
+            }
+        }
+        async cleanTransferredDownloadBlob(blob) {
+            this.clearFullSizeWait();
+            this.activity.attempts += 1;
+            this.setStatus('working', 'Cleaning full-size download', 'Using Gemini\'s native download channel...');
+            const startedAt = performance.now();
+            try {
+                await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+                const result = await this.cleanImageBlob(blob, 'native transfer');
+                this.activity.lastDurationMs = Math.round(performance.now() - startedAt);
+                this.recordResult(result);
+                if (result.changed) {
+                    const match = result.plan.matches[0];
+                    this.setStatus('success', 'Full-size download cleaned', `${match.logoSize}px match at ${match.x}, ${match.y} (${(match.confidence * 100).toFixed(1)}%).`);
+                } else {
+                    this.setStatus('warning', 'No watermark match', 'Gemini will save the full-size image unchanged.');
+                }
+                return result.blob;
+            } catch (error) {
+                this.activity.lastDurationMs = Math.round(performance.now() - startedAt);
+                this.activity.failures += 1;
+                this.updatePanelStats();
+                this.setStatus('error', 'Download cleaning failed', 'Gemini will save the original image.');
+                console.warn('[Gemini watermark remover] Transferred download processing failed:', error);
+                throw error;
+            }
+        }
+        recordResult(result) {
+            const summarizeMatch = (match) => match ? {
+                x: match.x,
+                y: match.y,
+                logoSize: match.logoSize,
+                confidence: match.confidence,
+                source: match.source || null,
+                reconstruction: match.reconstruction || null
+            } : null;
+            this.activity.lastAnalysis = {
+                found: result.plan.found,
+                confidence: result.plan.confidence,
+                candidates: [
+                    ...(result.plan.nearCornerCandidates || []),
+                    ...(result.plan.cornerCandidates || [])
+                ].map(summarizeMatch)
+            };
+            if (result.changed) {
+                this.activity.cleaned += 1;
+                this.activity.lastMatch = summarizeMatch(result.plan.matches[0]);
+            } else {
+                this.activity.unchanged += 1;
+            }
+            this.updatePanelStats();
+        }
+        async cleanDownloadUrl(url, filename = 'Gemini_Generated_Image_cleaned.png') {
+            this.clearFullSizeWait();
+            const cleanUrl = this.cleanUrl(url);
+            this.activity.attempts += 1;
+            this.setStatus('working', 'Cleaning download', 'Fetching the full-resolution image...');
+            try {
+                this.setStatus('working', 'Cleaning download', 'Matching and reconstructing the watermark region...');
+                let result;
+                if (cleanUrl.startsWith('blob:')) {
+                    const source = this.findImageForUrl(cleanUrl);
+                    if (!source) throw new Error('The displayed Gemini image is no longer available.');
+                    result = await this.cleanImageSourceForUrl(cleanUrl, source, 'download click');
+                } else {
+                    const response = await this.fetchImage(cleanUrl);
+                    if (!response.ok) throw new Error(`Image request failed (${response.status}).`);
+                    result = await this.cleanBlobForUrl(cleanUrl, await response.blob(), 'download click');
+                }
+                this.recordResult(result);
+                this.downloadBlob(result.blob, filename);
+                if (result.changed) {
+                    const match = result.plan.matches[0];
+                    this.setStatus('success', 'Cleaned download saved', `${match.logoSize}px match at ${match.x}, ${match.y} (${(match.confidence * 100).toFixed(1)}%).`);
+                } else {
+                    this.setStatus('warning', 'No watermark match', 'The original image was saved unchanged.');
+                }
+                return result;
+            } catch (error) {
+                this.activity.failures += 1;
+                this.setStatus('error', 'Download cleaning failed', error.message);
+                console.warn('[Gemini watermark remover] Click download processing failed:', error);
+                throw error;
+            }
+        }
+        async cleanLatestImage() {
+            const url = this.getLatestImageUrl();
+            if (!url) {
+                this.setStatus('warning', 'No generated image found');
+                return null;
+            }
+            return this.cleanDownloadUrl(url);
+        }
+        async cleanLocalFile(file) {
+            this.activity.attempts += 1;
+            this.setStatus('working', 'Cleaning local file', file.name);
+            try {
+                const result = await this.cleanImageBlob(file, 'local file');
+                this.recordResult(result);
+                const baseName = file.name.replace(/\.[^.]+$/, '');
+                this.downloadBlob(result.blob, `${baseName}-cleaned.png`);
+                this.setStatus(
+                    result.changed ? 'success' : 'warning',
+                    result.changed ? 'Cleaned file saved' : 'No watermark match',
+                    result.changed ? file.name : 'The file was saved unchanged.',
+                );
+                return result;
+            } catch (error) {
+                this.activity.failures += 1;
+                this.setStatus('error', 'File cleaning failed', error.message);
+                throw error;
+            }
+        }
+        setupClickInterceptor() {
+            window.addEventListener('click', (event) => {
+                if (!this.autoCleanDownloads) return;
+                const eventPath = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+                const elements = eventPath.filter((entry) => entry instanceof Element);
+                const control = elements.find((element) => element.matches('a, button, [role="button"]'));
+                if (!control) return;
+                const anchor = elements.find((element) => element.matches('a[href]')) || control.closest('a[href]');
+                if (anchor?.dataset.gwrBypass === 'true') return;
+                const directUrl = anchor?.href && this.isProcessableImageUrl(anchor.href) ? anchor.href : null;
+                const controlIndex = elements.indexOf(control);
+                const labelElements = elements.slice(0, controlIndex + 1).slice(-6);
+                const label = labelElements.flatMap((element) => [
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('title'),
+                    element.getAttribute('data-tooltip'),
+                    element.getAttribute('data-tooltip-text'),
+                    element.textContent
+                ]).filter(Boolean).join(' ').toLowerCase();
+                const looksLikeImageCopy = label.includes('copy image') ||
+                    label.includes('copy to clipboard') ||
+                    Boolean(control.closest('copy-button'));
+                if (looksLikeImageCopy) {
+                    this.beginClipboardCopyWait();
+                    return;
+                }
+                const looksLikeDownload = Boolean(directUrl) || label.includes('download');
+                if (!looksLikeDownload) return;
+                const imageUrl = directUrl || this.getImageUrlNearControl(control, elements);
+                if (!imageUrl) return;
+                if (this.isDownscaledBlobPreview(imageUrl)) {
+                    this.beginFullSizeWait();
+                    return;
+                }
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                const filename = anchor?.download || 'Gemini_Generated_Image_cleaned.png';
+                void this.cleanDownloadUrl(imageUrl, filename).catch(() => {});
+            }, true);
+        }
+        findTransferredImageBlob(value, depth = 0, seen = new WeakSet()) {
+            if (value instanceof Blob) {
+                const supportedType = !value.type || value.type.startsWith('image/') || value.type === 'application/octet-stream';
+                return supportedType && value.size >= 100000 ? { blob: value, target: value } : null;
+            }
+            if (value instanceof ArrayBuffer && value.byteLength >= 100000) {
+                return { blob: new Blob([value], { type: 'image/png' }), target: value };
+            }
+            if (ArrayBuffer.isView(value) && value.byteLength >= 100000) {
+                return {
+                    blob: new Blob([value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)], { type: 'image/png' }),
+                    target: value
+                };
+            }
+            if (!value || typeof value !== 'object' || depth >= 3 || seen.has(value)) return null;
+            seen.add(value);
+            const entries = Array.isArray(value) ? value.slice(0, 20) : Object.values(value).slice(0, 20);
+            for (const entry of entries) {
+                const candidate = this.findTransferredImageBlob(entry, depth + 1, seen);
+                if (candidate) return candidate;
+            }
+            return null;
+        }
+        replaceTransferredImage(value, target, replacement, depth = 0, seen = new WeakSet()) {
+            if (value === target) return replacement;
+            if (!value || typeof value !== 'object' || depth >= 3 || seen.has(value)) return value;
+            seen.add(value);
+            if (Array.isArray(value)) {
+                return value.map((entry) => this.replaceTransferredImage(entry, target, replacement, depth + 1, seen));
+            }
+            if (Object.getPrototypeOf(value) === Object.prototype) {
+                return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+                    key,
+                    this.replaceTransferredImage(entry, target, replacement, depth + 1, seen)
+                ]));
+            }
+            return value;
+        }
+        capturePendingTransfer(value) {
+            this.transferDiagnostics.calls += 1;
+            this.transferDiagnostics.blobSeen = value instanceof Blob;
+            this.transferDiagnostics.lastSize = value instanceof Blob ? value.size : 0;
+            this.transferDiagnostics.pendingAtCall = Boolean(this.fullSizeWaitTimer);
+            if (!this.fullSizeWaitTimer || !this.autoCleanDownloads) return null;
+            const candidate = this.findTransferredImageBlob(value);
+            if (!candidate) return null;
+            this.clearFullSizeWait();
+            return this.cleanTransferredDownloadBlob(candidate.blob)
+                .then((cleanedBlob) => this.replaceTransferredImage(value, candidate.target, cleanedBlob))
+                .catch(() => value);
+        }
+        setupDownloadTransferInterceptor() {
+            const remover = this;
+            const wrapPostMessage = (prototype) => {
+                if (!prototype?.postMessage || prototype.postMessage.__gwrWrapped) return;
+                const original = prototype.postMessage;
+                const wrapped = function (message, ...rest) {
+                    const cleanedTransfer = remover.capturePendingTransfer(message);
+                    if (cleanedTransfer) {
+                        void cleanedTransfer.then((cleanedMessage) => original.call(this, cleanedMessage, ...rest));
+                        return undefined;
+                    }
+                    return original.call(this, message, ...rest);
+                };
+                Object.defineProperty(wrapped, '__gwrWrapped', { value: true });
+                prototype.postMessage = wrapped;
+            };
+            wrapPostMessage(window.Worker?.prototype);
+            wrapPostMessage(window.MessagePort?.prototype);
+            wrapPostMessage(window.BroadcastChannel?.prototype);
+            wrapPostMessage(window.Window?.prototype);
+        }
+        setupDownloadArtifactInterceptor() {
+            const remover = this;
+            URL.createObjectURL = function (value) {
+                const url = remover.originalCreateObjectURL(value);
+                if (value instanceof Blob) remover.capturedBlobsByUrl.set(url, value);
+                return url;
+            };
+            URL.revokeObjectURL = function (url) {
+                remover.capturedBlobsByUrl.delete(String(url));
+                return remover.originalRevokeObjectURL(url);
+            };
+            HTMLAnchorElement.prototype.click = function () {
+                const href = this.href;
+                const capturedBlob = remover.capturedBlobsByUrl.get(href);
+                const shouldCapture = remover.autoCleanDownloads &&
+                    this.dataset.gwrBypass !== 'true' &&
+                    this.hasAttribute('download');
+                const looksLikeImageBlob = capturedBlob && (
+                    capturedBlob.type.startsWith('image/') ||
+                    /\.(?:png|jpe?g|webp)$/i.test(this.download)
+                );
+                if (shouldCapture && looksLikeImageBlob) {
+                    void remover.cleanCapturedDownloadBlob(capturedBlob, this.download).catch(() => {});
+                    return;
+                }
+                if (shouldCapture && CONSTANTS.URL_PATTERN.test(href)) {
+                    remover.clearFullSizeWait();
+                    void remover.cleanDownloadUrl(href, remover.cleanedFilename(this.download)).catch(() => {});
+                    return;
+                }
+                return remover.originalAnchorClick.call(this);
+            };
+        }
         setupObjectUrlCleanup() {
             window.addEventListener('pagehide', () => {
+                this.clearFullSizeWait();
+                this.clearClipboardCopyWait();
                 for (const objectUrl of this.objectUrls) URL.revokeObjectURL(objectUrl);
                 this.objectUrls.clear();
             }, { once: true });
@@ -1230,22 +3068,37 @@
                     : input instanceof URL
                         ? input.href
                         : input?.url;
-                if (!url || !CONSTANTS.DOWNLOAD_URL_PATTERN.test(url)) return originalFetch(input, init);
+                if (!this.autoCleanDownloads || !url || !CONSTANTS.DOWNLOAD_URL_PATTERN.test(url)) return originalFetch(input, init);
+                this.clearFullSizeWait();
                 const cleanUrl = this.cleanUrl(url);
+                this.activity.attempts += 1;
+                this.setStatus('working', 'Cleaning download', 'Intercepted Gemini image response.');
                 const response = await originalFetch(this.buildFetchInput(input, cleanUrl), init);
-                if (!response.ok) return response;
+                if (!response.ok) {
+                    this.activity.failures += 1;
+                    this.setStatus('error', 'Image request failed', `HTTP ${response.status}`);
+                    return response;
+                }
                 const originalResponse = response.clone();
                 try {
                     const blob = await response.blob();
                     const result = await this.cleanBlobForUrl(cleanUrl, blob, 'download');
-                    if (!result.changed) return originalResponse;
+                    this.recordResult(result);
+                    if (!result.changed) {
+                        this.setStatus('warning', 'No watermark match', 'Returning the original download unchanged.');
+                        return originalResponse;
+                    }
                     this.log(`Download cleaned (${result.plan.matches.length} match${result.plan.matches.length === 1 ? '' : 'es'}).`);
+                    const match = result.plan.matches[0];
+                    this.setStatus('success', 'Download cleaned', `${match.logoSize}px match (${(match.confidence * 100).toFixed(1)}%).`);
                     return new Response(result.blob, {
                         status: response.status,
                         statusText: response.statusText,
                         headers: new Headers(response.headers)
                     });
                 } catch (error) {
+                    this.activity.failures += 1;
+                    this.setStatus('error', 'Download cleaning failed', error.message);
                     console.warn('[Gemini watermark remover] Download processing failed, returning original:', error);
                     return originalResponse;
                 }
@@ -1267,41 +3120,95 @@
             img.src = objectUrl;
             if (img.srcset) img.srcset = objectUrl;
         }
-        async processImageElement(img) {
-            if (img.dataset.gwrProcessed === 'true') return;
-            const currentUrl = img.currentSrc || img.src;
-            if (!currentUrl || !CONSTANTS.URL_PATTERN.test(currentUrl)) return;
-            if (!img.closest('generated-image, .generated-image-container')) return;
-            img.dataset.gwrProcessed = 'true';
-            img.dataset.gwrStatus = 'processing';
-            try {
+        collectPageImageGroups() {
+            const groups = new Map();
+            const images = document.querySelectorAll('img');
+            images.forEach((image) => {
+                if (image.dataset.gwrStatus === 'cleaned' || image.dataset.gwrStatus === 'unchanged') return;
+                const currentUrl = this.getImageCandidateUrl(image);
+                if (!currentUrl) return;
+                const rect = image.getBoundingClientRect();
+                const longestEdge = Math.max(rect.width, rect.height, image.naturalWidth, image.naturalHeight);
+                if (longestEdge < 160) return;
                 const cleanUrl = this.cleanUrl(currentUrl);
-                const response = await this.originalFetch(cleanUrl);
-                if (!response.ok) {
-                    img.dataset.gwrStatus = 'fetch-failed';
-                    return;
-                }
-                const result = await this.cleanBlobForUrl(cleanUrl, await response.blob(), 'manual image');
-                if (!result.changed) {
-                    img.dataset.gwrStatus = 'unchanged';
-                    return;
-                }
-                await this.replaceImageElementSource(img, result.blob);
-                img.dataset.gwrStatus = 'cleaned';
-                this.log('Replaced cached image element with cleaned output.');
-            } catch (error) {
-                img.dataset.gwrStatus = 'failed';
-                console.warn('[Gemini watermark remover] Cached image processing failed:', error);
+                if (!groups.has(cleanUrl)) groups.set(cleanUrl, { cleanUrl, images: [] });
+                groups.get(cleanUrl).images.push(image);
+            });
+            return Array.from(groups.values()).filter((group) => (
+                group.images.some((image) => this.isVisibleImage(image))
+            )).map((group) => ({
+                ...group,
+                representative: this.selectBestGeneratedImage(group.images)
+            }));
+        }
+        async processPageImageGroup(group) {
+            group.images.forEach((image) => {
+                image.dataset.gwrProcessed = 'true';
+                image.dataset.gwrStatus = 'processing';
+            });
+            let result;
+            if (group.cleanUrl.startsWith('blob:')) {
+                result = await this.cleanImageSourceForUrl(group.cleanUrl, group.representative, 'manual image');
+            } else {
+                const response = await this.fetchImage(group.cleanUrl);
+                if (!response.ok) throw new Error(`Image request failed (${response.status}).`);
+                result = await this.cleanBlobForUrl(group.cleanUrl, await response.blob(), 'manual image');
             }
+            this.recordResult(result);
+            if (!result.changed) {
+                group.images.forEach((image) => { image.dataset.gwrStatus = 'unchanged'; });
+                return 'unchanged';
+            }
+            for (const image of group.images) {
+                if (!image.isConnected) continue;
+                await this.replaceImageElementSource(image, result.blob);
+                image.dataset.gwrStatus = 'cleaned';
+            }
+            this.log(`Replaced ${group.images.length} duplicate image element${group.images.length === 1 ? '' : 's'} with one cleaned result.`);
+            return 'cleaned';
         }
         processExistingImages() {
-            const images = document.querySelectorAll('img[src*="googleusercontent.com"]:not([data-gwr-processed])');
-            images.forEach((img) => void this.processImageElement(img));
+            if (this.pageScanPromise) {
+                this.setStatus('working', 'Cleaning page image', 'The current scan is still in progress.');
+                return this.pageScanPromise;
+            }
+            const groups = this.collectPageImageGroups();
+            if (groups.length === 0) {
+                this.setStatus('warning', 'No new page images found');
+                return Promise.resolve({ cleaned: 0, unchanged: 0, failed: 0 });
+            }
+            this.pageScanPromise = (async () => {
+                const totals = { cleaned: 0, unchanged: 0, failed: 0 };
+                for (let index = 0; index < groups.length; index += 1) {
+                    const group = groups[index];
+                    this.setStatus(
+                        'working',
+                        groups.length === 1 ? 'Cleaning page image' : 'Cleaning page images',
+                        `${index + 1} of ${groups.length} unique image${groups.length === 1 ? '' : 's'}.`
+                    );
+                    try {
+                        const outcome = await this.processPageImageGroup(group);
+                        totals[outcome] += 1;
+                    } catch (error) {
+                        totals.failed += 1;
+                        this.activity.failures += 1;
+                        group.images.forEach((image) => { image.dataset.gwrStatus = 'failed'; });
+                        console.warn('[Gemini watermark remover] Page image processing failed:', error);
+                    }
+                }
+                if (totals.failed > 0) {
+                    this.setStatus('error', 'Page image cleaning failed', `${totals.failed} unique image${totals.failed === 1 ? '' : 's'} failed.`);
+                } else if (totals.cleaned > 0) {
+                    this.setStatus('success', 'Page image cleaned', `${totals.cleaned} unique image${totals.cleaned === 1 ? '' : 's'} cleaned.`);
+                } else {
+                    this.setStatus('warning', 'Page image unchanged', 'No confident watermark match.');
+                }
+                return totals;
+            })().finally(() => {
+                this.pageScanPromise = null;
+            });
+            return this.pageScanPromise;
         }
     }
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => new GeminiWatermarkRemover());
-    } else {
-        new GeminiWatermarkRemover();
-    }
+    new GeminiWatermarkRemover();
 })();

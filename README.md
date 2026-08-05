@@ -34,7 +34,8 @@ Current numbers are from the private local fixture set used during development. 
 - Weak-case remover match: a difficult `48px` default-placement image still locked at `67.2%` NCC after the fallback placement rule was added.
 - Large watermark case: the ShareFile-style sample locked a `96px` template at `x:3404, y:992` with `94.4%` NCC.
 - Post-clean verification: rerunning on the cleaned ShareFile sample produced no confident watermark rematch (`68.6%` max NCC, below threshold).
-- Browser workflow: the userscript path was validated live against the same private development set plus the ShareFile sample, replacing Gemini image fetch/download responses with cleaned local blobs.
+- Browser workflow: the userscript download and clipboard paths are covered by a Playwright harness that exercises Gemini-style controls, processes a real `2048x2048` opt-in fixture, and verifies that no pixels outside the accepted watermark region changed.
+- Reconstruction quality: the scaled-template path ranks adaptive alpha, global/local directional, multiscale, and texture-patch candidates, then rejects clipping and watermark-shaped artifacts before confidence blending.
 
 ## Why this repo exists
 
@@ -89,6 +90,21 @@ Remove the watermark:
 node remove-gemini-watermark.js .\input.png .\outputs\cleaned.png
 ```
 
+Run the public synthetic regression suite:
+
+```powershell
+npm test
+```
+
+The suite covers fixed-placement removal, clean-image rejection, scaled detector-guided matching, repeat-clean no-op behavior, and PNG stream errors without bundling private image fixtures.
+
+Run the same regression suite against a local real image:
+
+```powershell
+$env:GEMINI_REAL_FIXTURE='C:\path\to\Gemini_Generated_Image.png'
+npm test
+```
+
 ## Browser workflow
 
 The repository also includes a browser-side implementation: [`remove-gemini-watermark.userscript.js`](remove-gemini-watermark.userscript.js).
@@ -97,13 +113,41 @@ It is designed for userscript managers such as [Tampermonkey](https://www.tamper
 
 Key behavior:
 
-- intercepts Gemini image fetch/download requests in-page
+- intercepts visible Gemini download controls as well as matching image fetch requests
+- intercepts Gemini's **Copy image** control and replaces its native `ClipboardItem` image payload with the locally cleaned PNG
 - upgrades matching image URLs to full-resolution fetches where possible
 - runs the same local cleanup logic in-browser without uploading images elsewhere
 - swaps cleaned blob URLs into generated-image elements
-- exposes `window.geminiWatermarkRemover.rescan()` and `window.geminiWatermarkRemover.stats()` for manual inspection
+- provides a compact status panel that starts minimized in the top-right, with clean-latest, local-file, rescan, and auto-clean controls when expanded
+- constructs the panel without HTML injection sinks so it works under Gemini's enforced Trusted Types policy
+- deduplicates visible page images by full-resolution URL and ignores hidden historical Gemini DOM nodes
+- discovers generated images from `currentSrc`, `src`, and `srcset` without depending on a specific Gemini container element
+- processes Gemini `blob:` display images directly from the decoded DOM element, avoiding CSP-blocked blob fetches while preserving natural resolution
+- recognizes 1024px page previews produced by downscaling Gemini's 2048px watermark, using a placement-constrained 96-to-48px template so nearby image highlights do not win the match
+- captures nested Download controls through the composed click path, even when Gemini prevents the native event first
+- preserves full download resolution: a 1024px `blob:` preview is left to Gemini's native `=s0` request, then full-size Blob or ArrayBuffer transfers into Gemini's opaque download sandbox are captured and cleaned before its `blob:null` download is created
+- installs transfer hooks at `document-start` for Worker, MessagePort, BroadcastChannel, and window messaging, while retaining fetch and programmatic-anchor fallbacks
+- forwards the cleaned full-resolution Blob through Gemini's original transfer channel, allowing its native download lifecycle and progress indicator to complete normally
+- forwards clipboard cleanup through Gemini's original `navigator.clipboard.write()` lifecycle, so copying still completes without starting a download
+- probes the known 1024px and 2048px watermark geometry before broad corner search, avoiding the expensive full-image detector for trusted placement matches
+- calibrates template opacity and half-pixel alignment before scoring global/local directional, multiscale, and bounded texture-patch reconstructions
+- uses confidence-weighted mask edges and explicit clipping, boundary, texture, and watermark-correlation penalties to reject visible artifacts
+- runs adaptive ROI reconstruction in a Worker through a narrowly scoped Trusted Types policy, with a deterministic main-thread fallback when page CSP forbids Worker creation
+- leaves the full-size waiting state after six seconds with a visible fallback when Gemini does not expose a cleanable download artifact
+- ends stalled image requests after 30 seconds with a visible error instead of leaving the panel busy indefinitely
+- reports accepted match size, position, confidence, cleaned/unchanged totals, and failures
+- exposes `cleanLatest()`, `cleanBlob()`, `rescan()`, `setAutoClean()`, and `stats()` through `window.geminiWatermarkRemover`
 
-This makes the repo useful in two modes:
+The userscript loads its pinned inpainting dependencies through `@require`, so the userscript manager must allow those metadata dependencies when installing or updating the script.
+
+Run the browser UI and real-download regression:
+
+```powershell
+$env:GEMINI_REAL_FIXTURE='C:\path\to\Gemini_Generated_Image.png'
+npm run test:browser
+```
+
+The browser suite also verifies Worker execution, clipboard parity, and correct cleanup through the CSP-blocked Worker fallback. This makes the repo useful in two modes:
 
 - offline/local CLI experimentation on PNGs
 - live browser cleanup through a userscript workflow

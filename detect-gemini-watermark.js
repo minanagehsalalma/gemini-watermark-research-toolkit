@@ -35,21 +35,30 @@ function setPixel(png, x, y, r, g, b, a = 255) {
 
 function loadPng(filePath) {
   return new Promise((resolve, reject) => {
-    fs.createReadStream(filePath)
-      .pipe(new PNG())
+    const input = fs.createReadStream(filePath);
+    const decoder = new PNG();
+
+    input.on('error', reject);
+    decoder
       .on('parsed', function onParsed() {
         resolve(this);
       })
       .on('error', reject);
+
+    input.pipe(decoder);
   });
 }
 
 function savePng(png, filePath) {
   return new Promise((resolve, reject) => {
-    const stream = fs.createWriteStream(filePath);
-    stream.on('finish', resolve);
-    stream.on('error', reject);
-    png.pack().pipe(stream);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const output = fs.createWriteStream(filePath);
+    const encoded = png.pack();
+
+    output.on('finish', resolve);
+    output.on('error', reject);
+    encoded.on('error', reject);
+    encoded.pipe(output);
   });
 }
 

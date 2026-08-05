@@ -6,6 +6,8 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { PNG } = require('pngjs');
 const { findWatermarkSparkles } = require('./detect-gemini-watermark.js');
+const { inpaintTelea } = require('./lib/inpaint-telea.js');
+const { adaptiveReconstructRegion } = require('./lib/adaptive-reconstruction.js');
 
 // Constants for pixel subtraction matching Real.js
 const CONSTANTS = {
@@ -22,9 +24,15 @@ const DEFAULT_PLACEMENT_MIN_SCORES = {
   48: 0.64,
   96: 0.58,
 };
+const SCALED_MATCH_SIZES = [56, 64, 72, 80, 88];
+const SCALED_MATCH_MIN_SCORE = 0.57;
+const SCALED_MATCH_ADVANTAGE = 0.1;
+const NEAR_CORNER_MIN_SCORES = { 48: 0.52, 96: 0.52 };
+const DETECTOR_GUIDED_MIN_SCORE = 0.57;
 const SECONDARY_MATCH_RATIO = 0.75;
 const TEMPLATE_CACHE = new Map();
 const SCALED_TEMPLATE_CACHE = new Map();
+const NCC_TEMPLATE_STATS_CACHE = new WeakMap();
 let OPENCV_PYTHON_RUNTIME;
 const RESIDUAL_HEAL_CONFIG = {
   grayThreshold: 212,
@@ -64,22 +72,30 @@ const ASSETS = {
 // --- Utilities ---
 function loadPng(filePath) {
   return new Promise((resolve, reject) => {
-    fs.createReadStream(filePath)
-      .pipe(new PNG())
+    const input = fs.createReadStream(filePath);
+    const decoder = new PNG();
+
+    input.on('error', reject);
+    decoder
       .on('parsed', function onParsed() {
         resolve(this);
       })
       .on('error', reject);
+
+    input.pipe(decoder);
   });
 }
 
 function savePng(png, filePath) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const stream = fs.createWriteStream(filePath);
-    stream.on('finish', resolve);
-    stream.on('error', reject);
-    png.pack().pipe(stream);
+    const output = fs.createWriteStream(filePath);
+    const encoded = png.pack();
+
+    output.on('finish', resolve);
+    output.on('error', reject);
+    encoded.on('error', reject);
+    encoded.pipe(output);
   });
 }
 
@@ -240,6 +256,44 @@ function getCornerSearchBounds(png, logoSize) {
     startY: Math.max(0, png.height - searchHeight - logoSize),
     endX: png.width - logoSize,
     endY: png.height - logoSize,
+  };
+}
+
+function getNearCornerSearchBounds(png, logoSize) {
+  const marginLimitX = Math.max(96, Math.floor(png.width * 0.12));
+  const marginLimitY = Math.max(96, Math.floor(png.height * 0.12));
+  return {
+    startX: Math.max(0, png.width - marginLimitX - logoSize),
+    startY: Math.max(0, png.height - marginLimitY - logoSize),
+    endX: png.width - logoSize,
+    endY: png.height - logoSize,
+  };
+}
+
+function getDownscaledPreviewSearchBounds(png, logoSize) {
+  const expectedX = png.width - logoSize - Math.round(png.width * 3 / 32);
+  const expectedY = png.height - logoSize - Math.round(png.height * 3 / 32);
+  const radius = Math.max(12, Math.round(logoSize / 4));
+  return {
+    startX: Math.max(0, expectedX - radius),
+    startY: Math.max(0, expectedY - radius),
+    endX: Math.min(png.width - logoSize, expectedX + radius),
+    endY: Math.min(png.height - logoSize, expectedY + radius),
+  };
+}
+
+function getLocalScaleSearchBounds(png, logoSize, referenceMatch) {
+  const nearCorner = getNearCornerSearchBounds(png, logoSize);
+  const centerX = referenceMatch.x + referenceMatch.logoSize / 2;
+  const centerY = referenceMatch.y + referenceMatch.logoSize / 2;
+  const expectedX = Math.round(centerX - logoSize / 2);
+  const expectedY = Math.round(centerY - logoSize / 2);
+  const radius = Math.max(24, Math.floor(logoSize / 3));
+  return {
+    startX: clamp(expectedX - radius, nearCorner.startX, nearCorner.endX),
+    startY: clamp(expectedY - radius, nearCorner.startY, nearCorner.endY),
+    endX: clamp(expectedX + radius, nearCorner.startX, nearCorner.endX),
+    endY: clamp(expectedY + radius, nearCorner.startY, nearCorner.endY),
   };
 }
 
@@ -644,13 +698,18 @@ function fillMaskByRowInterpolation(png, x0, y0, width, height, box, mask) {
 }
 
 function healScaledTemplateMatch(png, match) {
-  if (!match || match.logoSize === 48 || match.logoSize === 96 || !match.alphaMap) {
+  const requiresMaskHealing = [
+    'scaled-search',
+    'near-corner-search',
+    'geometry-placement-search',
+    'downscaled-preview-placement-search',
+  ].includes(match?.source);
+  if (!match || (!requiresMaskHealing && (match.logoSize === 48 || match.logoSize === 96)) || !match.alphaMap) {
     return false;
   }
 
   const alphaThreshold = 0.015;
-  const dilateRadius = Math.max(4, Math.floor(match.logoSize * 0.08));
-  const boxPadding = dilateRadius + 2;
+  const dilateRadius = Math.max(1, Math.floor(match.logoSize * 0.015));
   const pad = 8;
   const x0 = Math.max(0, match.x - pad);
   const y0 = Math.max(0, match.y - pad);
@@ -660,10 +719,6 @@ function healScaledTemplateMatch(png, match) {
   const height = y1 - y0 + 1;
   const mask = new Uint8Array(width * height);
   const maskPixels = [];
-  let maskX0 = width;
-  let maskY0 = height;
-  let maskX1 = -1;
-  let maskY1 = -1;
 
   for (let row = 0; row < match.logoSize; row += 1) {
     for (let col = 0; col < match.logoSize; col += 1) {
@@ -680,10 +735,6 @@ function healScaledTemplateMatch(png, match) {
 
       mask[localY * width + localX] = 1;
       maskPixels.push([localX, localY]);
-      if (localX < maskX0) maskX0 = localX;
-      if (localY < maskY0) maskY0 = localY;
-      if (localX > maskX1) maskX1 = localX;
-      if (localY > maskY1) maskY1 = localY;
     }
   }
 
@@ -692,15 +743,72 @@ function healScaledTemplateMatch(png, match) {
   }
 
   const dilatedMask = buildDilatedMask(width, height, maskPixels, dilateRadius);
-  const box = {
-    x0: Math.max(0, maskX0 - boxPadding),
-    y0: Math.max(0, maskY0 - boxPadding),
-    x1: Math.min(width - 1, maskX1 + boxPadding),
-    y1: Math.min(height - 1, maskY1 + boxPadding),
-  };
-
-  fillMaskByRowInterpolation(png, x0, y0, width, height, box, dilatedMask);
+  const snapshot = match.watermarkedRegion;
+  if (!snapshot || snapshot.x0 !== x0 || snapshot.y0 !== y0 || snapshot.width !== width || snapshot.height !== height) {
+    match.reconstruction = inpaintMaskStructureAware(png, x0, y0, width, height, dilatedMask);
+    return true;
+  }
+  const subtractedRgb = new Uint8ClampedArray(width * height * 3);
+  const alphaRegion = new Float32Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      const targetOffset = ((y * width) + x) * 3;
+      subtractedRgb[targetOffset] = png.data[sourceOffset];
+      subtractedRgb[targetOffset + 1] = png.data[sourceOffset + 1];
+      subtractedRgb[targetOffset + 2] = png.data[sourceOffset + 2];
+    }
+  }
+  for (let row = 0; row < match.logoSize; row += 1) {
+    for (let col = 0; col < match.logoSize; col += 1) {
+      const localX = (match.x - x0) + col;
+      const localY = (match.y - y0) + row;
+      if (localX < 0 || localY < 0 || localX >= width || localY >= height) continue;
+      alphaRegion[(localY * width) + localX] = match.alphaMap[(row * match.logoSize) + col];
+    }
+  }
+  const reconstruction = adaptiveReconstructRegion({
+    width,
+    height,
+    mask: dilatedMask,
+    alpha: alphaRegion,
+    watermarkedRgb: snapshot.rgb,
+    subtractedRgb,
+  });
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width) + x;
+      if (!dilatedMask[index]) continue;
+      const sourceOffset = index * 3;
+      const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      png.data[targetOffset] = reconstruction.rgb[sourceOffset];
+      png.data[targetOffset + 1] = reconstruction.rgb[sourceOffset + 1];
+      png.data[targetOffset + 2] = reconstruction.rgb[sourceOffset + 2];
+    }
+  }
+  match.reconstruction = { ...reconstruction.diagnostics, workerUsed: false };
+  delete match.watermarkedRegion;
   return true;
+}
+
+function captureMatchRegion(png, match, pad = 8) {
+  const x0 = Math.max(0, match.x - pad);
+  const y0 = Math.max(0, match.y - pad);
+  const x1 = Math.min(png.width - 1, match.x + match.logoSize - 1 + pad);
+  const y1 = Math.min(png.height - 1, match.y + match.logoSize - 1 + pad);
+  const width = x1 - x0 + 1;
+  const height = y1 - y0 + 1;
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      const targetOffset = ((y * width) + x) * 3;
+      rgb[targetOffset] = png.data[sourceOffset];
+      rgb[targetOffset + 1] = png.data[sourceOffset + 1];
+      rgb[targetOffset + 2] = png.data[sourceOffset + 2];
+    }
+  }
+  return { x0, y0, width, height, rgb };
 }
 
 function findLowContrastResidualComponents(png, x0, y0, width, height) {
@@ -853,6 +961,253 @@ function inpaintMask(png, x0, y0, width, height, mask, iterations) {
     }
     png.data.set(next);
   }
+}
+
+function inpaintMaskFromNearestBoundary(png, x0, y0, width, height, mask) {
+  const pixelCount = width * height;
+  const sourceByPixel = new Int32Array(pixelCount);
+  sourceByPixel.fill(-1);
+  const queue = new Int32Array(pixelCount);
+  let queueStart = 0;
+  let queueEnd = 0;
+  const neighbors = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1, 0], [1, 0],
+    [-1, 1], [0, 1], [1, 1],
+  ];
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (mask[index]) {
+        continue;
+      }
+
+      const touchesMask = neighbors.some(([dx, dy]) => {
+        const nx = x + dx;
+        const ny = y + dy;
+        return nx >= 0 && ny >= 0 && nx < width && ny < height && mask[ny * width + nx];
+      });
+      if (touchesMask) {
+        sourceByPixel[index] = index;
+        queue[queueEnd] = index;
+        queueEnd += 1;
+      }
+    }
+  }
+
+  while (queueStart < queueEnd) {
+    const index = queue[queueStart];
+    queueStart += 1;
+    const x = index % width;
+    const y = Math.floor(index / width);
+
+    for (const [dx, dy] of neighbors) {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+        continue;
+      }
+
+      const neighborIndex = ny * width + nx;
+      if (!mask[neighborIndex] || sourceByPixel[neighborIndex] !== -1) {
+        continue;
+      }
+
+      sourceByPixel[neighborIndex] = sourceByPixel[index];
+      queue[queueEnd] = neighborIndex;
+      queueEnd += 1;
+    }
+  }
+
+  const original = Buffer.from(png.data);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const sourceIndex = sourceByPixel[index];
+      if (!mask[index] || sourceIndex < 0) {
+        continue;
+      }
+
+      const sourceX = sourceIndex % width;
+      const sourceY = Math.floor(sourceIndex / width);
+      const sourceOffset = ((y0 + sourceY) * png.width + x0 + sourceX) << 2;
+      const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      png.data[targetOffset] = original[sourceOffset];
+      png.data[targetOffset + 1] = original[sourceOffset + 1];
+      png.data[targetOffset + 2] = original[sourceOffset + 2];
+    }
+  }
+}
+
+function inpaintMaskTelea(png, x0, y0, width, height, mask) {
+  for (let channel = 0; channel < 3; channel += 1) {
+    const values = new Float32Array(width * height);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+        values[y * width + x] = png.data[sourceOffset + channel];
+      }
+    }
+
+    inpaintTelea(width, height, values, mask, 3);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        if (!mask[index]) continue;
+        const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+        png.data[targetOffset + channel] = clamp(Math.round(values[index]), 0, 255);
+      }
+    }
+  }
+}
+
+const STRUCTURE_DIRECTIONS = [
+  [0, 1], [1, 0], [1, 1], [1, -1],
+  [1, 2], [2, 1], [1, -2], [2, -1],
+];
+
+function findDirectionalEndpoint(mask, width, height, x, y, dx, dy, sign) {
+  const limit = Math.max(width, height);
+  for (let distance = 1; distance <= limit; distance += 1) {
+    const nextX = x + (dx * distance * sign);
+    const nextY = y + (dy * distance * sign);
+    if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) return null;
+    const index = (nextY * width) + nextX;
+    if (!mask[index]) return { index, distance };
+  }
+  return null;
+}
+
+function rankStructureDirections(rgb, mask, width, height) {
+  return STRUCTURE_DIRECTIONS.map(([dx, dy]) => {
+    const differences = [];
+    let eligible = 0;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = (y & 1); x < width; x += 2) {
+        if (!mask[(y * width) + x]) continue;
+        eligible += 1;
+        const first = findDirectionalEndpoint(mask, width, height, x, y, dx, dy, -1);
+        const second = findDirectionalEndpoint(mask, width, height, x, y, dx, dy, 1);
+        if (!first || !second) continue;
+        const firstOffset = first.index * 3;
+        const secondOffset = second.index * 3;
+        differences.push((
+          Math.abs(rgb[firstOffset] - rgb[secondOffset]) +
+          Math.abs(rgb[firstOffset + 1] - rgb[secondOffset + 1]) +
+          Math.abs(rgb[firstOffset + 2] - rgb[secondOffset + 2])
+        ) / 3);
+      }
+    }
+    if (differences.length === 0) return { dx, dy, score: Infinity, coverage: 0 };
+    differences.sort((a, b) => a - b);
+    const median = differences[Math.floor(differences.length * 0.5)];
+    const upperQuartile = differences[Math.floor(differences.length * 0.75)];
+    const coverage = differences.length / Math.max(1, eligible);
+    return {
+      dx,
+      dy,
+      score: median + (upperQuartile * 0.35) + ((1 - coverage) * 100),
+      coverage,
+    };
+  }).sort((a, b) => a.score - b.score);
+}
+
+function smoothStructureFill(rgb, mask, width, height) {
+  const source = new Uint8ClampedArray(rgb);
+  const radius = 2;
+  const colorSigmaSquared = 18 * 18 * 2;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width) + x;
+      if (!mask[index]) continue;
+      const offset = index * 3;
+      const sums = [0, 0, 0];
+      let totalWeight = 0;
+      for (let dy = -radius; dy <= radius; dy += 1) {
+        for (let dx = -radius; dx <= radius; dx += 1) {
+          const nextX = x + dx;
+          const nextY = y + dy;
+          if (nextX < 0 || nextY < 0 || nextX >= width || nextY >= height) continue;
+          const nextOffset = ((nextY * width) + nextX) * 3;
+          let colorDistance = 0;
+          for (let channel = 0; channel < 3; channel += 1) {
+            const difference = source[nextOffset + channel] - source[offset + channel];
+            colorDistance += difference * difference;
+          }
+          const spatialWeight = Math.exp(-((dx * dx) + (dy * dy)) / 4);
+          const colorWeight = Math.exp(-colorDistance / colorSigmaSquared);
+          const weight = spatialWeight * colorWeight;
+          totalWeight += weight;
+          for (let channel = 0; channel < 3; channel += 1) sums[channel] += source[nextOffset + channel] * weight;
+        }
+      }
+      if (totalWeight <= 0) continue;
+      for (let channel = 0; channel < 3; channel += 1) rgb[offset + channel] = Math.round(sums[channel] / totalWeight);
+    }
+  }
+}
+
+function inpaintMaskStructureAware(png, x0, y0, width, height, mask) {
+  const rgb = new Uint8ClampedArray(width * height * 3);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const sourceOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      const targetOffset = ((y * width) + x) * 3;
+      rgb[targetOffset] = png.data[sourceOffset];
+      rgb[targetOffset + 1] = png.data[sourceOffset + 1];
+      rgb[targetOffset + 2] = png.data[sourceOffset + 2];
+    }
+  }
+
+  const rankedDirections = rankStructureDirections(rgb, mask, width, height);
+  const bestDirection = rankedDirections[0];
+  if (!bestDirection || !Number.isFinite(bestDirection.score) || bestDirection.score > 38) {
+    inpaintMaskTelea(png, x0, y0, width, height, mask);
+    return { method: 'telea', direction: null, score: bestDirection?.score ?? Infinity };
+  }
+
+  const original = new Uint8ClampedArray(rgb);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width) + x;
+      if (!mask[index]) continue;
+      let endpoints = null;
+      for (const direction of rankedDirections) {
+        const first = findDirectionalEndpoint(mask, width, height, x, y, direction.dx, direction.dy, -1);
+        const second = findDirectionalEndpoint(mask, width, height, x, y, direction.dx, direction.dy, 1);
+        if (first && second) {
+          endpoints = { first, second };
+          break;
+        }
+      }
+      if (!endpoints) continue;
+      const totalDistance = endpoints.first.distance + endpoints.second.distance;
+      const targetOffset = index * 3;
+      const firstOffset = endpoints.first.index * 3;
+      const secondOffset = endpoints.second.index * 3;
+      for (let channel = 0; channel < 3; channel += 1) {
+        rgb[targetOffset + channel] = Math.round((
+          (original[firstOffset + channel] * endpoints.second.distance) +
+          (original[secondOffset + channel] * endpoints.first.distance)
+        ) / totalDistance);
+      }
+    }
+  }
+
+  if (bestDirection.score < 12) smoothStructureFill(rgb, mask, width, height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width) + x;
+      if (!mask[index]) continue;
+      const sourceOffset = index * 3;
+      const targetOffset = ((y0 + y) * png.width + x0 + x) << 2;
+      png.data[targetOffset] = rgb[sourceOffset];
+      png.data[targetOffset + 1] = rgb[sourceOffset + 1];
+      png.data[targetOffset + 2] = rgb[sourceOffset + 2];
+    }
+  }
+  return { method: 'directional', direction: [bestDirection.dx, bestDirection.dy], score: bestDirection.score };
 }
 
 function findCornerResidualSeed(png, x0, y0, width, height) {
@@ -1083,12 +1438,17 @@ async function healResidualCornerSparkle(png, primaryMatch) {
 // high contrast garbage (like bright meme text or pixel drawings) which derailed
 // the previous contrast-based logic.
 
-function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
-  const gray = options.gray ?? buildGrayscale(png);
-  const suppressed = options.suppressed ?? [];
+function getNccTemplateStats(alphaMap, logoSize) {
   const N = logoSize * logoSize;
-  
-  // 1. Template stats (Full resolution)
+  if (!alphaMap || alphaMap.length !== N) {
+    throw new RangeError(`Expected a ${logoSize}x${logoSize} alpha map.`);
+  }
+
+  const cached = NCC_TEMPLATE_STATS_CACHE.get(alphaMap);
+  if (cached?.logoSize === logoSize) {
+    return cached;
+  }
+
   let tSum = 0;
   for (let i = 0; i < N; i++) tSum += alphaMap[i];
   const tMean = tSum / N;
@@ -1102,7 +1462,6 @@ function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
   }
   const tNorm = Math.sqrt(tVarSum);
 
-  // 2. Template stats (Coarse pass - stride of 3 saves massive processing time)
   const stride = 3;
   let coarseCount = 0;
   let tSumCoarse = 0;
@@ -1125,6 +1484,33 @@ function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
     }
   }
   const tNormCoarse = Math.sqrt(tVarSumCoarse);
+
+  const stats = {
+    logoSize,
+    N,
+    stride,
+    coarseCount,
+    tDiffs,
+    tNorm,
+    tDiffsCoarse,
+    tNormCoarse,
+  };
+  NCC_TEMPLATE_STATS_CACHE.set(alphaMap, stats);
+  return stats;
+}
+
+function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
+  const gray = options.gray ?? buildGrayscale(png);
+  const suppressed = options.suppressed ?? [];
+  const {
+    N,
+    stride,
+    coarseCount,
+    tDiffs,
+    tNorm,
+    tDiffsCoarse,
+    tNormCoarse,
+  } = getNccTemplateStats(alphaMap, logoSize);
 
   // Limit search to the bottom right quadrant to save time and dodge central text
   const startX = options.startX ?? Math.floor(png.width * 0.5);
@@ -1184,7 +1570,7 @@ function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
   let fineBestPos = bestPos;
   for (let y = bestPos.y - stride; y <= bestPos.y + stride; y++) {
     for (let x = bestPos.x - stride; x <= bestPos.x + stride; x++) {
-      if (x < 0 || y < 0 || x > endX || y > endY) continue;
+      if (x < startX || y < startY || x > endX || y > endY) continue;
       if (overlapsBounds(createBounds(x, y, logoSize), suppressed, Math.floor(logoSize / 3))) {
         continue;
       }
@@ -1236,9 +1622,10 @@ function findWatermarkNCC(png, alphaMap, logoSize, options = {}) {
 // --- Exact Alpha Map Matching & Removal Logic ---
 
 async function planWatermarkRemoval(png) {
-  const [template48, template96] = await Promise.all([
+  const [template48, template96, downscaled96Template] = await Promise.all([
     getAlphaTemplate(48),
     getAlphaTemplate(96),
+    getScaledAlphaTemplate(96, 48),
   ]);
   const gray = buildGrayscale(png);
   const suppressed = [];
@@ -1269,26 +1656,28 @@ async function planWatermarkRemoval(png) {
     startY: default96Y,
     endY: default96Y,
   });
-  if (default96Score.score >= 0.15 || default48Score.score >= 0.15) {
-    const chosen = default96Score.score >= default48Score.score
-      ? {
-          x: default96X,
-          y: default96Y,
-          bbox: createBounds(default96X, default96Y, template96.logoSize),
-          logoSize: template96.logoSize,
-          alphaMap: template96.alphaMap,
-          confidence: default96Score.score,
-          source: 'default-placement',
-        }
-      : {
-          x: default48X,
-          y: default48Y,
-          bbox: createBounds(default48X, default48Y, template48.logoSize),
-          logoSize: template48.logoSize,
-          alphaMap: template48.alphaMap,
-          confidence: default48Score.score,
-          source: 'default-placement',
-        };
+  const defaultCandidates = [
+    {
+      ...default48Score,
+      logoSize: template48.logoSize,
+      alphaMap: template48.alphaMap,
+      confidence: default48Score.score,
+      source: 'default-placement',
+    },
+    {
+      ...default96Score,
+      logoSize: template96.logoSize,
+      alphaMap: template96.alphaMap,
+      confidence: default96Score.score,
+      source: 'default-placement',
+    },
+  ].filter((candidate) => (
+    candidate.confidence >= DEFAULT_PLACEMENT_MIN_SCORES[candidate.logoSize]
+  ));
+  if (defaultCandidates.length > 0) {
+    const chosen = defaultCandidates.reduce((best, candidate) => (
+      candidate.confidence > best.confidence ? candidate : best
+    ));
     console.log(`✓ Locked ${chosen.logoSize}px default-placement template at x:${chosen.x}, y:${chosen.y} (Confidence: ${(chosen.confidence * 100).toFixed(1)}%)`);
     return {
       found: true,
@@ -1298,6 +1687,105 @@ async function planWatermarkRemoval(png) {
       alphaMap: chosen.alphaMap,
       confidence: chosen.confidence,
       matches: [chosen],
+      match48: lastMatch48,
+      match96: lastMatch96,
+    };
+  }
+
+  const previewPlacementCandidates = [template48, template96, downscaled96Template].map((template, index) => {
+    const match = findWatermarkNCC(png, template.alphaMap, template.logoSize, {
+      gray,
+      ...getDownscaledPreviewSearchBounds(png, template.logoSize),
+    });
+    return {
+      ...match,
+      logoSize: template.logoSize,
+      alphaMap: template.alphaMap,
+      confidence: match.score,
+      source: index === 2 ? 'downscaled-preview-placement-search' : 'geometry-placement-search',
+    };
+  });
+  const previewPlacementMatch = previewPlacementCandidates
+    .filter((match) => match.confidence >= NEAR_CORNER_MIN_SCORES[match.logoSize])
+    .reduce((best, match) => (!best || match.confidence > best.confidence ? match : best), null);
+  const supportsGeometryFastPath = png.width === png.height && (png.width === 1024 || png.width === 2048);
+  if (supportsGeometryFastPath && previewPlacementMatch) {
+    console.log(`✓ Locked ${previewPlacementMatch.logoSize}px geometry-placement template at x:${previewPlacementMatch.x}, y:${previewPlacementMatch.y} (Confidence: ${(previewPlacementMatch.confidence * 100).toFixed(1)}%)`);
+    return {
+      found: true,
+      x: previewPlacementMatch.x,
+      y: previewPlacementMatch.y,
+      logoSize: previewPlacementMatch.logoSize,
+      alphaMap: previewPlacementMatch.alphaMap,
+      confidence: previewPlacementMatch.confidence,
+      matches: [previewPlacementMatch],
+      match48: lastMatch48,
+      match96: lastMatch96,
+    };
+  }
+  const nearCornerCandidates = [template48, template96, downscaled96Template].map((template, index) => {
+    const match = findWatermarkNCC(png, template.alphaMap, template.logoSize, {
+      gray,
+      ...getNearCornerSearchBounds(png, template.logoSize),
+    });
+    return {
+      ...match,
+      logoSize: template.logoSize,
+      alphaMap: template.alphaMap,
+      confidence: match.score,
+      source: index === 2 ? 'downscaled-preview-search' : 'near-corner-search',
+    };
+  });
+  const nearCornerMatch = nearCornerCandidates
+    .filter((match) => match.confidence >= NEAR_CORNER_MIN_SCORES[match.logoSize])
+    .reduce((best, match) => (!best || match.confidence > best.confidence ? match : best), null);
+
+  if (nearCornerMatch) {
+    let localScaledMatch = null;
+    for (const logoSize of SCALED_MATCH_SIZES) {
+      const template = await getScaledAlphaTemplate(48, logoSize);
+      const match = findWatermarkNCC(png, template.alphaMap, logoSize, {
+        gray,
+        ...getLocalScaleSearchBounds(png, logoSize, nearCornerMatch),
+      });
+      if (!localScaledMatch || match.score > localScaledMatch.confidence) {
+        localScaledMatch = {
+          ...match,
+          logoSize,
+          alphaMap: template.alphaMap,
+          confidence: match.score,
+          source: 'scaled-search',
+        };
+      }
+    }
+
+    if (
+      localScaledMatch?.confidence >= SCALED_MATCH_MIN_SCORE &&
+      localScaledMatch.confidence >= nearCornerMatch.confidence + SCALED_MATCH_ADVANTAGE
+    ) {
+      console.log(`✓ Locked ${localScaledMatch.logoSize}px scaled template at x:${localScaledMatch.x}, y:${localScaledMatch.y} (Confidence: ${(localScaledMatch.confidence * 100).toFixed(1)}%)`);
+      return {
+        found: true,
+        x: localScaledMatch.x,
+        y: localScaledMatch.y,
+        logoSize: localScaledMatch.logoSize,
+        alphaMap: localScaledMatch.alphaMap,
+        confidence: localScaledMatch.confidence,
+        matches: [localScaledMatch],
+        match48: lastMatch48,
+        match96: lastMatch96,
+      };
+    }
+
+    console.log(`✓ Locked ${nearCornerMatch.logoSize}px near-corner template at x:${nearCornerMatch.x}, y:${nearCornerMatch.y} (Confidence: ${(nearCornerMatch.confidence * 100).toFixed(1)}%)`);
+    return {
+      found: true,
+      x: nearCornerMatch.x,
+      y: nearCornerMatch.y,
+      logoSize: nearCornerMatch.logoSize,
+      alphaMap: nearCornerMatch.alphaMap,
+      confidence: nearCornerMatch.confidence,
+      matches: [nearCornerMatch],
       match48: lastMatch48,
       match96: lastMatch96,
     };
@@ -1381,6 +1869,45 @@ async function planWatermarkRemoval(png) {
     };
   }
 
+  let bestScaledMatch = null;
+  for (const logoSize of SCALED_MATCH_SIZES) {
+    const template = await getScaledAlphaTemplate(48, logoSize);
+    const match = findWatermarkNCC(png, template.alphaMap, logoSize, {
+      gray,
+      ...getCornerSearchBounds(png, logoSize),
+    });
+    if (
+      Number.isFinite(match.score) &&
+      isNearCornerPlacement(png, match, logoSize) &&
+      (!bestScaledMatch || match.score > bestScaledMatch.confidence)
+    ) {
+      bestScaledMatch = {
+        ...match,
+        logoSize,
+        alphaMap: template.alphaMap,
+        confidence: match.score,
+        source: 'scaled-search',
+      };
+    }
+  }
+
+  const scaledIsClearlyBetter =
+    bestScaledMatch?.confidence >= SCALED_MATCH_MIN_SCORE;
+  if (scaledIsClearlyBetter) {
+    console.log(`✓ Locked ${bestScaledMatch.logoSize}px scaled template at x:${bestScaledMatch.x}, y:${bestScaledMatch.y} (Confidence: ${(bestScaledMatch.confidence * 100).toFixed(1)}%)`);
+    return {
+      found: true,
+      x: bestScaledMatch.x,
+      y: bestScaledMatch.y,
+      logoSize: bestScaledMatch.logoSize,
+      alphaMap: bestScaledMatch.alphaMap,
+      confidence: bestScaledMatch.confidence,
+      matches: [bestScaledMatch],
+      match48: lastMatch48,
+      match96: lastMatch96,
+    };
+  }
+
   const rawConfidence = Math.max(lastMatch48.score, lastMatch96.score);
   const confidence = Number.isFinite(rawConfidence) ? rawConfidence : 0;
   try {
@@ -1400,21 +1927,19 @@ async function planWatermarkRemoval(png) {
       endY: Math.min(png.height - scaledTemplate.logoSize, detectorPrimary.bbox.y1 + 20),
     });
 
-    const refinedUsable = Number.isFinite(refined.score) && refined.score >= 0.35;
-    const fallbackCandidate = refinedUsable
-      ? refined
-      : {
-          x: detectorPrimary.bbox.x0,
-          y: detectorPrimary.bbox.y0,
-          bbox: createBounds(detectorPrimary.bbox.x0, detectorPrimary.bbox.y0, scaledTemplate.logoSize),
-          score: detectorResult.confidence,
-        };
-
     const detectorReliable =
       detectorResult.confidence >= 0.72 &&
       detectorPrimary.geometry >= 0.5 &&
       detectorPrimary.requiredArmCoverage >= 0.7;
-    if (isNearCornerPlacement(png, fallbackCandidate, scaledTemplate.logoSize) && (refinedUsable || detectorReliable)) {
+    const refinedUsable =
+      Number.isFinite(refined.score) &&
+      refined.score >= DETECTOR_GUIDED_MIN_SCORE;
+    const fallbackCandidate = refined;
+    if (
+      detectorReliable &&
+      refinedUsable &&
+      isNearCornerPlacement(png, fallbackCandidate, scaledTemplate.logoSize)
+    ) {
       console.log(`✓ Locked ${scaledTemplate.logoSize}px detector-guided template at x:${fallbackCandidate.x}, y:${fallbackCandidate.y} (Confidence: ${(fallbackCandidate.score * 100).toFixed(1)}%)`);
       return {
         found: true,
@@ -1461,6 +1986,8 @@ async function removeWatermark(png) {
     console.log(`⚠ ${plan.reason} Leaving the image unchanged.`);
     return png;
   }
+
+  for (const match of plan.matches) match.watermarkedRegion = captureMatchRegion(png, match);
 
   for (const match of plan.matches) {
     const pos = {
@@ -1509,9 +2036,20 @@ async function removeWatermark(png) {
 
   healScaledTemplateMatch(png, plan.matches[0]);
 
-  try {
-    const detectorResult = findWatermarkSparkles(png);
+  const needsDetectorCleanup = ![
+    'default-placement',
+    'geometry-placement-search',
+    'downscaled-preview-placement-search',
+  ].includes(plan.matches[0]?.source);
+  if (needsDetectorCleanup) {
+    try {
+      const detectorResult = findWatermarkSparkles(png);
     const sparkle = detectorResult.sparkles[0];
+    const primaryBounds = createBounds(
+      plan.matches[0].x,
+      plan.matches[0].y,
+      plan.matches[0].logoSize,
+    );
     const residualSize = Math.max(24, Math.min(48, sparkle.size));
     const residualCandidate = {
       x: sparkle.bbox.x0,
@@ -1519,6 +2057,7 @@ async function removeWatermark(png) {
     };
 
     if (
+      overlapsBounds(sparkle.bbox, [primaryBounds]) &&
       isNearCornerPlacement(png, residualCandidate, residualSize) &&
       detectorResult.confidence >= 0.62 &&
       sparkle.geometry >= 0.55
@@ -1566,8 +2105,9 @@ async function removeWatermark(png) {
       }
 
     }
-  } catch (error) {
-    // Ignore post-cleanup detector failures.
+    } catch (error) {
+      // Ignore post-cleanup detector failures.
+    }
   }
 
   await healResidualCornerSparkle(png, plan.matches[0]);
@@ -1615,5 +2155,6 @@ module.exports = {
   savePng,
   decodeBase64Png,
   getAlphaTemplate,
-  findWatermarkNCC
+  findWatermarkNCC,
+  inpaintMaskStructureAware,
 };
